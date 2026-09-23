@@ -762,6 +762,9 @@ async function prepareMedia(mediaId) {
   };
 
   if (sourceProfile.streamReady) {
+    if (meta?.preparedId) {
+      await fs.unlink(path.join(MEDIA_DIR, path.basename(meta.preparedId))).catch(() => {});
+    }
     meta = {
       ...meta,
       status:"READY_DIRECT",
@@ -1616,10 +1619,17 @@ const server = app.listen(PORT, "0.0.0.0", () => {
           mediaId:desired.mediaId
         }));
       } catch (err) {
+        const msg = String(err?.message || err);
+        if (msg === "media_requires_bitrate_optimization") {
+          await updateSlotState(slotId, {
+            desired:"stopped",
+            stoppedAt:new Date().toISOString()
+          }).catch(() => {});
+        }
         console.error(JSON.stringify({
           event:"slot_restore_failed",
           slotId,
-          error:sanitizeLog(err?.message || err)
+          error:sanitizeLog(msg)
         }));
       }
     }

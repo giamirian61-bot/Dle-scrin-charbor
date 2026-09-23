@@ -102,6 +102,7 @@ function storageCard(m){
   const optimize=m.status==="OPTIMIZE_NEEDED";
   const preparing=m.status==="PREPARING";
   const queued=m.status==="PREPARE_QUEUED";
+  const bucket=m.sourceType==="bucket";
   const source=m.sourceVideoBitrate;
   const target=m.recommendedVideoBitrate;
 
@@ -109,6 +110,7 @@ function storageCard(m){
   if(ready) action='<button class="btn secondary" disabled>READY</button>';
   else if(preparing) action='<button class="btn primary" disabled>Preparing…</button>';
   else if(queued) action='<button class="btn secondary" disabled>Queued</button>';
+  else if(bucket) action='<button class="btn secondary" disabled>Needs re-export</button>';
   else action='<button class="btn primary prepareBtn">'+(optimize?'Optimize bitrate':'Prepare')+'</button>';
 
   return `<article class="storage-card" data-id="${esc(m.id)}">
@@ -364,13 +366,45 @@ q("#addStreamBtn").addEventListener("click",async()=>{
 });
 q("#fileInput").addEventListener("change",async e=>{
   const f=e.target.files?.[0]; if(!f)return;
-  const fd=new FormData();fd.append("file",f);
-  q("#uploadState").textContent="Uploading "+f.name+"…";
+  q("#uploadState").textContent="Preparing secure upload: "+f.name+"…";
   try{
-    await api("/api/media",{method:"POST",body:fd});
-    q("#uploadState").textContent="Uploaded: "+f.name;
-    await loadAll();toast("Video uploaded to Storage");
-  }catch(err){q("#uploadState").textContent="Upload failed";toast(err.message,true)}
+    const prep=await api("/api/bucket/upload-url",{
+      method:"POST",
+      body:JSON.stringify({name:f.name,size:f.size,type:f.type||"video/mp4"})
+    });
+
+    const form=new FormData();
+    Object.entries(prep.fields||{}).forEach(([k,v])=>form.append(k,v));
+    form.append("file",f);
+
+    q("#uploadState").textContent="Uploading directly to Storage Bucket: "+f.name+"…";
+    const up=await fetch(prep.uploadUrl,{method:"POST",body:form});
+    if(!up.ok) throw new Error("Bucket upload failed: HTTP "+up.status);
+
+    await api("/api/bucket/complete",{
+      method:"POST",
+      body:JSON.stringify({id:prep.id})
+    });
+
+    q("#uploadState").textContent="Uploaded. Checking video with ffprobe…";
+
+    const deadline=Date.now()+20*60*1000;
+    while(Date.now()<deadline){
+      await new Promise(r=>setTimeout(r,3000));
+      const media=await api("/api/bucket/media/"+encodeURIComponent(prep.id));
+      q("#uploadState").textContent="Video check: "+media.status;
+      if(["READY_DIRECT","PREPARE_NEEDED","ERROR"].includes(media.status)){
+        await loadAll();
+        if(media.status==="READY_DIRECT") toast("Video is READY for streaming");
+        else if(media.status==="PREPARE_NEEDED") toast("Video uploaded, but needs a stream-compatible re-export",true);
+        else toast("Video analysis failed",true);
+        break;
+      }
+    }
+  }catch(err){
+    q("#uploadState").textContent="Upload failed";
+    toast(err.message,true);
+  }
   e.target.value="";
 });
 

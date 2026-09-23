@@ -45,7 +45,22 @@ const STREAM_CONFIGS_FILE = path.join(MEDIA_DIR, ".stream-configs.json");
 
 await fs.mkdir(MEDIA_DIR, { recursive: true });
 
-app.use(helmet());
+const bucketConnectSrc = ["'self'"];
+try {
+  if (process.env.BUCKET_ENDPOINT) {
+    const endpointHost = new URL(process.env.BUCKET_ENDPOINT).hostname;
+    bucketConnectSrc.push(`https://${endpointHost}`);
+    bucketConnectSrc.push(`https://*.${endpointHost}`);
+  }
+} catch {}
+
+app.use(helmet({
+  contentSecurityPolicy:{
+    directives:{
+      connectSrc:bucketConnectSrc
+    }
+  }
+}));
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 app.use(rateLimit({

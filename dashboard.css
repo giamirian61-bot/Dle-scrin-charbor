@@ -46,3 +46,5 @@ nav{display:grid;gap:8px}.nav-item{width:100%;border:0;background:transparent;co
 .key-status.saved{color:#57e4bd;font-weight:800}
 .field-help{font-size:11px;color:#7f90a8;margin-top:5px}
 .eye:disabled{opacity:.35;cursor:not-allowed}
+
+.storage-error{color:#ff8e88;font-size:12px;word-break:break-word}

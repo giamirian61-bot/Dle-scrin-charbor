@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 const app = express();
-const PORT = Number(process.env.PORT || 3000);
+const PORT = 3000;
 const MEDIA_DIR = process.env.MEDIA_DIR || "/data/media";
 const OWNER_TOKEN = process.env.OWNER_TOKEN || "";
 const YOUTUBE_STREAM_KEY = process.env.YOUTUBE_STREAM_KEY || "";

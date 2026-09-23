@@ -48,3 +48,7 @@ nav{display:grid;gap:8px}.nav-item{width:100%;border:0;background:transparent;co
 .eye:disabled{opacity:.35;cursor:not-allowed}
 
 .storage-error{color:#ff8e88;font-size:12px;word-break:break-word}
+.upload-progress-label{margin-top:5px;color:#c5d3e6;font-weight:700}
+.upload-progress{height:9px;border-radius:999px;background:#202b3d;overflow:hidden;margin:3px 0 2px}
+.upload-progress span{display:block;height:100%;background:linear-gradient(90deg,#7c3aed,#2dd4bf);transition:width .35s ease}
+.storage-card:has(.upload-progress){border-color:#3b4f70}

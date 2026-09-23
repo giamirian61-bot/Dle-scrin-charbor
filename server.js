@@ -7,6 +7,14 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import {
+  bucketConfigured,
+  ensureBucketCors,
+  createVideoUploadPost,
+  createBucketReadUrl,
+  headBucketObject,
+  deleteBucketObject
+} from "./bucket-storage.js";
 
 const execFileAsync = promisify(execFile);
 const app = express();
@@ -23,6 +31,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const BITRATE_POLICY_VERSION = 2;
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 400 * 1024 * 1024);
+const MAX_BUCKET_FILE_BYTES = Number(process.env.MAX_BUCKET_FILE_BYTES || 8 * 1024 * 1024 * 1024);
+const BUCKET_MEDIA_FILE = path.join(MEDIA_DIR, ".bucket-media.json");
 const LEGACY_STATE_FILE = path.join(MEDIA_DIR, ".stream-state.json");
 const SLOT_STATE_FILE = path.join(MEDIA_DIR, ".slots-state.json");
 const STREAM_CONFIGS_FILE = path.join(MEDIA_DIR, ".stream-configs.json");
@@ -531,6 +541,183 @@ async function writeMeta(id, meta) {
   );
 }
 
+async function readBucketMediaState() {
+  try {
+    const parsed = JSON.parse(await fs.readFile(BUCKET_MEDIA_FILE, "utf8"));
+    return { items:Array.isArray(parsed?.items) ? parsed.items : [] };
+  } catch {
+    return { items:[] };
+  }
+}
+
+async function writeBucketMediaState(state) {
+  const tmp = BUCKET_MEDIA_FILE + ".tmp";
+  await fs.writeFile(tmp, JSON.stringify(state, null, 2), "utf8");
+  await fs.rename(tmp, BUCKET_MEDIA_FILE);
+}
+
+async function getBucketMedia(id) {
+  const state = await readBucketMediaState();
+  return state.items.find(item => item.id === String(id)) || null;
+}
+
+async function upsertBucketMedia(item) {
+  const state = await readBucketMediaState();
+  const idx = state.items.findIndex(x => x.id === item.id);
+  if (idx >= 0) state.items[idx] = item;
+  else state.items.push(item);
+  await writeBucketMediaState(state);
+  return item;
+}
+
+async function removeBucketMedia(id) {
+  const state = await readBucketMediaState();
+  const next = state.items.filter(item => item.id !== String(id));
+  await writeBucketMediaState({ items:next });
+}
+
+function publicBucketMedia(item) {
+  const profile = item?.profile || null;
+  return {
+    id:item.id,
+    sourceType:"bucket",
+    size:item.size || null,
+    originalName:item.originalName || item.id,
+    status:item.status || "UNKNOWN",
+    probe:item.probe || null,
+    profile,
+    preparedId:null,
+    preparedProbe:null,
+    preparedProfile:null,
+    preparedSize:null,
+    bitratePolicyVersion:BITRATE_POLICY_VERSION,
+    recommendedVideoBitrate:profile?.recommendedVideoBitrate || profile?.bitratePolicy?.recommendedVideoBitrate || null,
+    sourceVideoBitrate:profile?.bitratePolicy?.sourceVideoBitrate || null,
+    prepareError:item.prepareError || null,
+    error:item.error || null,
+    createdAt:item.createdAt || null
+  };
+}
+
+async function listBucketMedia() {
+  const state = await readBucketMediaState();
+  return state.items.map(publicBucketMedia);
+}
+
+async function mediaExists(id) {
+  if (await getBucketMedia(id)) return true;
+  try {
+    await fs.access(path.join(MEDIA_DIR, path.basename(String(id))));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function probeRemoteKeyframes(input) {
+  const { stdout } = await execFileAsync("ffprobe", [
+    "-v","error",
+    "-select_streams","v:0",
+    "-skip_frame","nokey",
+    "-show_entries","frame=pts_time",
+    "-of","csv=p=0",
+    input
+  ], { timeout:900_000, maxBuffer:20 * 1024 * 1024 });
+
+  const times = stdout
+    .split(/\r?\n/)
+    .map(line => Number(line.replace(/[^0-9.+-]/g, "")))
+    .filter(Number.isFinite);
+
+  let maxGap = null;
+  if (times.length >= 2) {
+    maxGap = 0;
+    for (let i=1; i<times.length; i++) {
+      maxGap = Math.max(maxGap, times[i] - times[i - 1]);
+    }
+  }
+  return { keyframeCount:times.length, maxKeyframeGap:maxGap };
+}
+
+async function analyzeRemoteMedia(input, knownSize) {
+  const probe = await probeFile(input);
+  const summary = summarizeProbe(probe);
+  const durationSec = Number(summary.duration || 0);
+  summary.fileSize = Number(knownSize || 0) || null;
+  if (!summary.formatBitRate && summary.fileSize && durationSec > 0) {
+    summary.estimatedTotalBitRate = Math.round((summary.fileSize * 8) / durationSec);
+  } else {
+    summary.estimatedTotalBitRate = summary.formatBitRate ? Number(summary.formatBitRate) : null;
+  }
+  summary.keyframes = summary.video
+    ? await probeRemoteKeyframes(input)
+    : { keyframeCount:0, maxKeyframeGap:null };
+  return summary;
+}
+
+const bucketAnalysisJobs = new Set();
+
+async function analyzeBucketMedia(id) {
+  if (bucketAnalysisJobs.has(id)) return;
+  bucketAnalysisJobs.add(id);
+  try {
+    let item = await getBucketMedia(id);
+    if (!item) throw new Error("bucket_media_not_found");
+
+    const head = await headBucketObject(item.key);
+    if (!head.size || head.size > MAX_BUCKET_FILE_BYTES) {
+      throw new Error("bucket_media_size_invalid");
+    }
+
+    item = {
+      ...item,
+      size:head.size,
+      contentType:head.contentType || item.contentType || null,
+      status:"ANALYZING",
+      error:null,
+      updatedAt:new Date().toISOString()
+    };
+    await upsertBucketMedia(item);
+
+    const readUrl = await createBucketReadUrl(item.key, 7200);
+    const analysis = await analyzeRemoteMedia(readUrl, head.size);
+    if (!analysis.video) throw new Error("No video stream detected");
+    const profile = chooseProfile(analysis);
+
+    item = {
+      ...item,
+      probe:analysis,
+      profile,
+      status:profile.streamReady ? "READY_DIRECT" : "PREPARE_NEEDED",
+      analyzedAt:new Date().toISOString(),
+      updatedAt:new Date().toISOString()
+    };
+    await upsertBucketMedia(item);
+
+    void notifyTelegram(`📦 Stream Harbor
+Видео проверено в Bucket
+Файл: ${item.originalName}
+Размер: ${(head.size/1024/1024).toFixed(1)} MB
+Статус: ${item.status}`);
+  } catch (err) {
+    const message = sanitizeLog(err?.message || err);
+    const current = await getBucketMedia(id);
+    if (current) {
+      await upsertBucketMedia({
+        ...current,
+        status:"ERROR",
+        error:message,
+        updatedAt:new Date().toISOString()
+      });
+    }
+    void notifyTelegram(`🚨 Stream Harbor
+Ошибка проверки видео в Bucket
+Ошибка: ${message}`);
+  } finally {
+    bucketAnalysisJobs.delete(id);
+  }
+}
+
 const activeSlots = new Map();
 const restartTimers = new Map();
 let prepareJob = null;
@@ -586,6 +773,20 @@ function buildFfmpegArgs(filePath, profile, target) {
 async function resolveStreamSource(mediaId) {
   const id = path.basename(String(mediaId || ""));
   if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
+
+  const bucketItem = await getBucketMedia(id);
+  if (bucketItem) {
+    if (bucketItem.status !== "READY_DIRECT" || !bucketItem.profile?.streamReady || bucketItem.profile.mode !== "copy") {
+      throw new Error("media_requires_preparation");
+    }
+    const streamPath = await createBucketReadUrl(bucketItem.key, 604800);
+    return {
+      id,
+      streamPath,
+      streamProbe:bucketItem.probe,
+      profile:bucketItem.profile
+    };
+  }
 
   const sourcePath = path.join(MEDIA_DIR, id);
   await fs.access(sourcePath);
@@ -672,7 +873,7 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
   if (!effectiveStreamKey) throw new Error("slot_stream_key_not_configured");
 
   const source = await resolveStreamSource(mediaId);
-  const sourceMeta = await readMeta(source.id).catch(() => null);
+  const sourceMeta = (await getBucketMedia(source.id)) || await readMeta(source.id).catch(() => null);
   const sourceName = sourceMeta?.originalName || source.id;
   const baseUrl = String(rtmpUrl || YOUTUBE_RTMPS_BASE).replace(/\/+$/, "");
   const target = `${baseUrl}/${effectiveStreamKey}`;
@@ -823,7 +1024,7 @@ async function stopSlot(slotId) {
   const active = activeSlots.get(id);
   if (!active) return { ok:true, slotId:id, state:"idle" };
 
-  const stopMeta = await readMeta(active.file).catch(() => null);
+  const stopMeta = (await getBucketMedia(active.file)) || await readMeta(active.file).catch(() => null);
   const stopName = stopMeta?.originalName || active.file;
   active.intentionalStop = true;
   activeSlots.delete(id);
@@ -1202,6 +1403,7 @@ app.get("/health", async (_req, res) => res.json({
   streamingSlots:activeSlots.size,
   youtubeKeyConfigured:Boolean(YOUTUBE_STREAM_KEY),
   telegramConfigured:telegramConfigured(),
+  bucketConfigured:bucketConfigured(),
   persistentState:true,
   preparing:Boolean(prepareJob),
   prepareQueueLength:prepareQueue.length,
@@ -1222,7 +1424,87 @@ app.get("/api/system", requireOwner, async (_req, res) => {
 });
 
 app.get("/api/media", requireOwner, async (_req, res) => {
-  res.json({ items:await listMedia() });
+  const [localItems, bucketItems] = await Promise.all([
+    listMedia(),
+    bucketConfigured() ? listBucketMedia() : Promise.resolve([])
+  ]);
+  res.json({ items:[...bucketItems, ...localItems] });
+});
+
+app.post("/api/bucket/upload-url", requireOwner, async (req, res) => {
+  if (!bucketConfigured()) return res.status(503).json({ error:"bucket_not_configured" });
+
+  const originalName = normalizeOriginalName(String(req.body?.name || "video.mp4")).slice(0,240);
+  const size = Number(req.body?.size || 0);
+  const contentType = String(req.body?.type || "video/mp4");
+
+  if (!size || size < 1) return res.status(400).json({ error:"invalid_file_size" });
+  if (size > MAX_BUCKET_FILE_BYTES) return res.status(413).json({ error:"file_too_large" });
+  if (!contentType.startsWith("video/") && !/\.(mp4|mov|m4v|webm)$/i.test(originalName)) {
+    return res.status(415).json({ error:"video_file_required" });
+  }
+
+  const ext = path.extname(originalName).slice(0,10).replace(/[^.a-zA-Z0-9]/g,"") || ".mp4";
+  const id = "bkt_" + crypto.randomUUID() + ext;
+  const key = "media/" + id;
+
+  const upload = await createVideoUploadPost({
+    key,
+    contentType,
+    maxBytes:MAX_BUCKET_FILE_BYTES
+  });
+
+  const item = {
+    id,
+    key,
+    originalName,
+    size,
+    contentType,
+    status:"UPLOADING",
+    createdAt:new Date().toISOString(),
+    updatedAt:new Date().toISOString()
+  };
+  await upsertBucketMedia(item);
+
+  res.status(201).json({
+    id,
+    uploadUrl:upload.url,
+    fields:upload.fields,
+    maxBytes:MAX_BUCKET_FILE_BYTES
+  });
+});
+
+app.post("/api/bucket/complete", requireOwner, async (req, res) => {
+  const id = path.basename(String(req.body?.id || ""));
+  const item = await getBucketMedia(id);
+  if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+
+  try {
+    const head = await headBucketObject(item.key);
+    if (!head.size) return res.status(422).json({ error:"bucket_object_empty" });
+    if (head.size > MAX_BUCKET_FILE_BYTES) return res.status(413).json({ error:"file_too_large" });
+
+    await upsertBucketMedia({
+      ...item,
+      size:head.size,
+      contentType:head.contentType || item.contentType || null,
+      status:"ANALYZING",
+      error:null,
+      updatedAt:new Date().toISOString()
+    });
+
+    void analyzeBucketMedia(id);
+    res.status(202).json({ ok:true, id, status:"ANALYZING" });
+  } catch (err) {
+    res.status(422).json({ error:"bucket_object_not_found", detail:sanitizeLog(err?.message || err) });
+  }
+});
+
+app.get("/api/bucket/media/:id", requireOwner, async (req, res) => {
+  const id = path.basename(String(req.params.id || ""));
+  const item = await getBucketMedia(id);
+  if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+  res.json(publicBucketMedia(item));
 });
 
 app.post("/api/media", requireOwner, upload.single("file"), async (req, res) => {
@@ -1274,6 +1556,15 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
     return res.status(409).json({ error:"file_is_preparing" });
   }
 
+  const bucketMeta = await getBucketMedia(id);
+  if (bucketMeta) {
+    await deleteBucketObject(bucketMeta.key).catch(err => {
+      if (err?.name !== "NoSuchKey") throw err;
+    });
+    await removeBucketMedia(id);
+    return res.json({ ok:true, sourceType:"bucket" });
+  }
+
   const meta = await readMeta(id);
 
   await fs.unlink(target).catch(err => {
@@ -1289,6 +1580,9 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
 
 app.post("/api/media/:id/prepare", requireOwner, async (req, res) => {
   try {
+    if (await getBucketMedia(path.basename(String(req.params.id || "")))) {
+      return res.status(409).json({ error:"bucket_media_requires_reexport" });
+    }
     const result = await enqueuePrepare(req.params.id);
     res.json({ ok:true, ...result });
   } catch (err) {
@@ -1388,7 +1682,7 @@ app.patch("/api/streams/:id", requireOwner, async (req, res) => {
       next.mediaId = null;
     } else {
       const mediaId = path.basename(String(req.body.mediaId));
-      await fs.access(path.join(MEDIA_DIR, mediaId));
+      if (!(await mediaExists(mediaId))) return res.status(404).json({ error:"media_not_found" });
       next.mediaId = mediaId;
     }
   }
@@ -1842,6 +2136,17 @@ app.use((err, _req, res, _next) => {
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Stream Harbor backend listening on ${PORT}`);
+  if (bucketConfigured()) {
+    const origin = process.env.RAILWAY_PUBLIC_DOMAIN
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+      : "https://stream-harbor-backend-production.up.railway.app";
+    ensureBucketCors(origin)
+      .then(() => console.log(JSON.stringify({ event:"bucket_cors_ready", origin })))
+      .catch(err => console.error(JSON.stringify({
+        event:"bucket_cors_failed",
+        error:sanitizeLog(err?.message || err)
+      })));
+  }
   void notifyTelegram(`🟢 Stream Harbor
 Сервер запущен
 Слотов: ${STREAM_SLOT_COUNT}

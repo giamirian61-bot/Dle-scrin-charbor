@@ -10,7 +10,7 @@ button,input,textarea,select{font:inherit}
 .shell{min-height:100vh;display:grid;grid-template-columns:250px 1fr}
 .sidebar{position:sticky;top:0;height:100vh;border-right:1px solid var(--line);background:#0d1421;padding:24px 16px;display:flex;flex-direction:column}
 .brand{display:flex;gap:12px;align-items:center;padding:0 10px 28px}
-.brand-mark{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--purple),#a855f7);display:grid;place-items:center;font-weight:900}
+.brand-mark{width:48px;height:48px;display:grid;place-items:center;flex:0 0 48px}.brand-mark img{width:48px;height:48px;object-fit:contain;display:block}
 .brand-title{font-weight:800;font-size:18px}.brand-sub{font-size:12px;color:var(--muted);margin-top:2px}
 nav{display:grid;gap:8px}.nav-item{width:100%;border:0;background:transparent;color:#b9c6d8;text-align:left;padding:13px 14px;border-radius:10px;cursor:pointer}
 .nav-item:hover,.nav-item.active{background:#2b2450;color:#fff}.nav-item span{display:inline-block;width:28px}

@@ -19,6 +19,8 @@ const YOUTUBE_STREAM_KEY = process.env.YOUTUBE_STREAM_KEY || "";
 const YOUTUBE_RTMPS_BASE = process.env.YOUTUBE_RTMPS_BASE || "rtmps://a.rtmps.youtube.com/live2";
 const STREAM_SLOT_COUNT = Math.min(8, Math.max(1, Number(process.env.STREAM_SLOT_COUNT || 2)));
 const SLOT_IDS = Array.from({ length:STREAM_SLOT_COUNT }, (_, i) => String(i + 1));
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const BITRATE_POLICY_VERSION = 2;
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 400 * 1024 * 1024);
 const LEGACY_STATE_FILE = path.join(MEDIA_DIR, ".stream-state.json");
@@ -86,10 +88,55 @@ function sanitizeLog(value) {
   let s = String(value ?? "");
   const secrets = new Set([
     YOUTUBE_STREAM_KEY,
+    TELEGRAM_BOT_TOKEN,
     ...SLOT_IDS.map(id => process.env[`YOUTUBE_STREAM_KEY_${id}`] || "")
   ].filter(Boolean));
   for (const secret of secrets) s = s.split(secret).join("[REDACTED]");
   return s;
+}
+
+function telegramConfigured() {
+  return Boolean(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+}
+
+async function notifyTelegram(message) {
+  if (!telegramConfigured()) return false;
+  const text = sanitizeLog(String(message || "")).slice(0, 3500);
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body:JSON.stringify({
+        chat_id:TELEGRAM_CHAT_ID,
+        text,
+        disable_web_page_preview:true
+      })
+    });
+    if (!response.ok) throw new Error(`telegram_http_${response.status}`);
+    return true;
+  } catch (err) {
+    console.error(JSON.stringify({
+      event:"telegram_notify_failed",
+      error:sanitizeLog(err?.message || err)
+    }));
+    return false;
+  }
+}
+
+async function storageStats() {
+  try {
+    const stat = await fs.statfs(MEDIA_DIR);
+    const blockSize = Number(stat.bsize || stat.frsize || 0);
+    const totalBytes = Number(stat.blocks || 0) * blockSize;
+    const freeBytes = Number(stat.bavail || stat.bfree || 0) * blockSize;
+    return {
+      totalBytes,
+      freeBytes,
+      usedBytes:Math.max(0, totalBytes - freeBytes)
+    };
+  } catch {
+    return null;
+  }
 }
 
 const storage = multer.diskStorage({
@@ -625,6 +672,8 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
   if (!effectiveStreamKey) throw new Error("slot_stream_key_not_configured");
 
   const source = await resolveStreamSource(mediaId);
+  const sourceMeta = await readMeta(source.id).catch(() => null);
+  const sourceName = sourceMeta?.originalName || source.id;
   const baseUrl = String(rtmpUrl || YOUTUBE_RTMPS_BASE).replace(/\/+$/, "");
   const target = `${baseUrl}/${effectiveStreamKey}`;
 
@@ -686,6 +735,12 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
 
     if (snapshot?.intentionalStop) return;
 
+    void notifyTelegram(`⚠️ Stream Harbor
+Slot ${id}: FFmpeg/worker завершился аварийно
+Файл: ${sourceName}
+Код: ${code ?? "null"}, сигнал: ${signal ?? "null"}
+Автоперезапуск: ${retryCount < 3 ? "будет выполнен" : "лимит исчерпан"}`);
+
     const state = await readSlotsState();
     const desired = state.slots[id] || { desired:"stopped" };
     const shouldRestart =
@@ -714,6 +769,10 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
             attempt:retryCount + 1,
             error:sanitizeLog(err?.message || err)
           }));
+          void notifyTelegram(`🚨 Stream Harbor
+Slot ${id}: автоперезапуск не удался
+Попытка: ${retryCount + 1}
+Ошибка: ${sanitizeLog(err?.message || err)}`);
         }
       }, 10_000);
 
@@ -728,6 +787,13 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
       streamId:streamId || null,
       requestedAt:new Date().toISOString()
     });
+    void notifyTelegram(`▶️ Stream Harbor
+Slot ${id}: запуск потока
+Файл: ${sourceName}`);
+  } else {
+    void notifyTelegram(`♻️ Stream Harbor
+Slot ${id}: поток восстановлен после перезапуска
+Файл: ${sourceName}`);
   }
 
   return {
@@ -757,6 +823,8 @@ async function stopSlot(slotId) {
   const active = activeSlots.get(id);
   if (!active) return { ok:true, slotId:id, state:"idle" };
 
+  const stopMeta = await readMeta(active.file).catch(() => null);
+  const stopName = stopMeta?.originalName || active.file;
   active.intentionalStop = true;
   activeSlots.delete(id);
 
@@ -764,6 +832,10 @@ async function stopSlot(slotId) {
   setTimeout(() => {
     try { active.worker.kill("SIGKILL"); } catch {}
   }, 8000).unref();
+
+  void notifyTelegram(`⏹ Stream Harbor
+Slot ${id}: поток остановлен
+Файл: ${stopName}`);
 
   return { ok:true, slotId:id, state:"stopping", pid:active.pid };
 }
@@ -864,6 +936,9 @@ async function prepareMedia(mediaId) {
     profile:sourceProfile
   };
   await writeMeta(id, meta);
+  void notifyTelegram(`🛠 Stream Harbor
+Подготовка видео началась
+Файл: ${meta.originalName || id}`);
 
   let buffer = "";
   child.stderr.on("data", chunk => {
@@ -893,11 +968,16 @@ async function prepareMedia(mediaId) {
       if (exitCode !== 0) {
         await fs.unlink(preparedPath).catch(() => {});
         const failedMeta = await readMeta(id) || meta;
+        const prepareError = job.lastError || `ffmpeg_exit_${exitCode ?? signal}`;
         await writeMeta(id, {
           ...failedMeta,
           status:"PREPARE_FAILED",
-          prepareError:job.lastError || `ffmpeg_exit_${exitCode ?? signal}`
+          prepareError
         });
+        void notifyTelegram(`🚨 Stream Harbor
+Подготовка видео не удалась
+Файл: ${failedMeta.originalName || id}
+Ошибка: ${sanitizeLog(prepareError)}`);
         return;
       }
 
@@ -911,6 +991,9 @@ async function prepareMedia(mediaId) {
           status:"PREPARE_FAILED",
           prepareError:"prepared_file_not_stream_ready"
         });
+        void notifyTelegram(`🚨 Stream Harbor
+Подготовленный файл не прошёл финальную проверку
+Файл: ${failedMeta.originalName || id}`);
         return;
       }
 
@@ -928,13 +1011,21 @@ async function prepareMedia(mediaId) {
         preparedAt:new Date().toISOString(),
         prepareError:null
       });
+      void notifyTelegram(`✅ Stream Harbor
+Видео подготовлено и готово к эфиру
+Файл: ${completedMeta.originalName || id}`);
     } catch (err) {
       const failedMeta = await readMeta(id) || meta;
+      const prepareError = sanitizeLog(err?.message || err);
       await writeMeta(id, {
         ...failedMeta,
         status:"PREPARE_FAILED",
-        prepareError:sanitizeLog(err?.message || err)
+        prepareError
       }).catch(() => {});
+      void notifyTelegram(`🚨 Stream Harbor
+Ошибка финализации видео
+Файл: ${failedMeta.originalName || id}
+Ошибка: ${prepareError}`);
     } finally {
       if (prepareJob?.pid === child.pid) prepareJob = null;
       setImmediate(() => runNextPrepareJob().catch(err => {
@@ -1105,15 +1196,30 @@ async function listMedia() {
   return items;
 }
 
-app.get("/health", (_req, res) => res.json({
+app.get("/health", async (_req, res) => res.json({
   ok:true,
   ffmpeg:true,
   streamingSlots:activeSlots.size,
   youtubeKeyConfigured:Boolean(YOUTUBE_STREAM_KEY),
+  telegramConfigured:telegramConfigured(),
   persistentState:true,
   preparing:Boolean(prepareJob),
-  slotCount:STREAM_SLOT_COUNT
+  prepareQueueLength:prepareQueue.length,
+  slotCount:STREAM_SLOT_COUNT,
+  storage:await storageStats()
 }));
+
+app.get("/api/system", requireOwner, async (_req, res) => {
+  res.json({
+    ok:true,
+    streamingSlots:activeSlots.size,
+    preparing:Boolean(prepareJob),
+    prepareQueueLength:prepareQueue.length,
+    slotCount:STREAM_SLOT_COUNT,
+    telegramConfigured:telegramConfigured(),
+    storage:await storageStats()
+  });
+});
 
 app.get("/api/media", requireOwner, async (_req, res) => {
   res.json({ items:await listMedia() });
@@ -1139,10 +1245,17 @@ app.post("/api/media", requireOwner, upload.single("file"), async (req, res) => 
       profile
     };
     await writeMeta(req.file.filename, meta);
+    void notifyTelegram(`📥 Stream Harbor
+Видео загружено и проверено
+Файл: ${originalName}
+Статус: ${meta.status}`);
 
     res.status(201).json(meta);
   } catch (err) {
     await fs.unlink(req.file.path).catch(() => {});
+    void notifyTelegram(`🚨 Stream Harbor
+Ошибка загрузки/проверки видео
+Ошибка: ${sanitizeLog(err?.message || err)}`);
     res.status(422).json({
       error:"invalid_video",
       detail:String(err.message || err)
@@ -1339,6 +1452,19 @@ app.post("/api/streams/:id/stop", requireOwner, async (req, res) => {
   res.json(await stopSlot(String(item.slotId)));
 });
 
+app.post("/api/streams/stop-all", requireOwner, async (_req, res) => {
+  const results = [];
+  for (const slotId of SLOT_IDS) {
+    try {
+      results.push(await stopSlot(slotId));
+    } catch (err) {
+      results.push({ ok:false, slotId, error:sanitizeLog(err?.message || err) });
+    }
+  }
+  void notifyTelegram("🛑 Stream Harbor\nАварийная остановка всех потоков выполнена");
+  res.json({ ok:true, results });
+});
+
 app.get("/api/slots", requireOwner, async (_req, res) => {
   const state = await readSlotsState();
   const preparation = prepareJob
@@ -1420,6 +1546,10 @@ app.get("/dashboard.css", requireOwner, (_req, res) => {
 
 app.get("/dashboard.js", requireOwner, (_req, res) => {
   res.type("application/javascript").sendFile(path.join(process.cwd(), "dashboard.js"));
+});
+
+app.get("/logo.png", requireOwner, (_req, res) => {
+  res.type("image/png").sendFile(path.join(process.cwd(), "logo.png"));
 });
 
 app.get("/test-upload", requireOwner, (_req, res) => {
@@ -1712,6 +1842,10 @@ app.use((err, _req, res, _next) => {
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Stream Harbor backend listening on ${PORT}`);
+  void notifyTelegram(`🟢 Stream Harbor
+Сервер запущен
+Слотов: ${STREAM_SLOT_COUNT}
+Telegram: активен`);
 
   setTimeout(async () => {
     const state = await readSlotsState();
@@ -1739,6 +1873,8 @@ const server = app.listen(PORT, "0.0.0.0", () => {
           slotId,
           mediaId:desired.mediaId
         }));
+        void notifyTelegram(`♻️ Stream Harbor
+Slot ${slotId}: восстановлен после перезапуска сервера`);
       } catch (err) {
         const msg = String(err?.message || err);
         if (msg === "media_requires_bitrate_optimization") {
@@ -1752,6 +1888,9 @@ const server = app.listen(PORT, "0.0.0.0", () => {
           slotId,
           error:sanitizeLog(msg)
         }));
+        void notifyTelegram(`🚨 Stream Harbor
+Slot ${slotId}: не удалось восстановить после перезапуска
+Ошибка: ${sanitizeLog(msg)}`);
       }
     }
   }, 2500).unref();
@@ -1759,6 +1898,9 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 
 async function gracefulShutdown(signal) {
   console.log(JSON.stringify({ event:"shutdown", signal }));
+  await notifyTelegram(`🟠 Stream Harbor
+Сервер завершает работу
+Сигнал: ${signal}`);
 
   for (const active of activeSlots.values()) {
     try {

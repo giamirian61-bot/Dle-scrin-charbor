@@ -117,25 +117,31 @@ function telegramConfigured() {
 async function notifyTelegram(message) {
   if (!telegramConfigured()) return false;
   const text = sanitizeLog(String(message || "")).slice(0, 3500);
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body:JSON.stringify({
-        chat_id:TELEGRAM_CHAT_ID,
-        text,
-        disable_web_page_preview:true
-      })
-    });
-    if (!response.ok) throw new Error(`telegram_http_${response.status}`);
-    return true;
-  } catch (err) {
-    console.error(JSON.stringify({
-      event:"telegram_notify_failed",
-      error:sanitizeLog(err?.message || err)
-    }));
-    return false;
+  let lastErr = null;
+  for (let attempt=1; attempt<=3; attempt++) {
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body:JSON.stringify({
+          chat_id:TELEGRAM_CHAT_ID,
+          text,
+          disable_web_page_preview:true
+        }),
+        signal:AbortSignal.timeout(10000)
+      });
+      if (!response.ok) throw new Error(`telegram_http_${response.status}`);
+      return true;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < 3) await new Promise(r => setTimeout(r, 1500 * attempt));
+    }
   }
+  console.error(JSON.stringify({
+    event:"telegram_notify_failed",
+    error:sanitizeLog(lastErr?.message || lastErr)
+  }));
+  return false;
 }
 
 async function storageStats() {
@@ -600,7 +606,14 @@ function publicBucketMedia(item) {
     sourceVideoBitrate:profile?.bitratePolicy?.sourceVideoBitrate || null,
     prepareError:item.prepareError || null,
     error:item.error || null,
-    createdAt:item.createdAt || null
+    createdAt:item.createdAt || null,
+    updatedAt:item.updatedAt || null,
+    progressPct:Number.isFinite(Number(item.progressPct)) ? Number(item.progressPct) : null,
+    uploadedParts:Number(item.uploadedParts || 0),
+    totalParts:Number(item.totalParts || 0),
+    uploadedBytes:Number(item.uploadedBytes || 0),
+    lastProgressAt:item.lastProgressAt || null,
+    stalledAt:item.stalledAt || null
   };
 }
 
@@ -608,6 +621,43 @@ async function listBucketMedia() {
   const state = await readBucketMediaState();
   return state.items.map(publicBucketMedia);
 }
+
+const UPLOAD_STALL_MS = Math.max(2 * 60 * 1000, Number(process.env.UPLOAD_STALL_MS || 10 * 60 * 1000));
+
+async function scanStalledUploads() {
+  const state = await readBucketMediaState();
+  const now = Date.now();
+  for (const item of state.items) {
+    if (!item?.uploadId || item.status !== "UPLOADING") continue;
+    const last = Date.parse(item.lastProgressAt || item.updatedAt || item.createdAt || "");
+    if (!Number.isFinite(last) || now - last < UPLOAD_STALL_MS) continue;
+
+    const stalledAt = new Date().toISOString();
+    await upsertBucketMedia({
+      ...item,
+      status:"STALLED",
+      stalledAt,
+      error:"upload_stalled",
+      updatedAt:stalledAt
+    });
+
+    const pct = Number.isFinite(Number(item.progressPct)) ? Math.round(Number(item.progressPct)) : 0;
+    const quietMin = Math.max(1, Math.round((now - last) / 60000));
+    void notifyTelegram(`🚨 Stream Harbor
+Загрузка зависла
+Файл: ${item.originalName || item.id}
+Прогресс: ${pct}%
+Нет движения: ${quietMin} мин.
+Нужно проверить соединение и при необходимости перезапустить загрузку.`);
+  }
+}
+
+setInterval(() => {
+  scanStalledUploads().catch(err => console.error(JSON.stringify({
+    event:"upload_watchdog_failed",
+    error:sanitizeLog(err?.message || err)
+  })));
+}, 60_000).unref();
 
 async function mediaExists(id) {
   if (await getBucketMedia(id)) return true;
@@ -1455,6 +1505,7 @@ app.post("/api/bucket/multipart/start", requireOwner, async (req, res) => {
   const { uploadId } = await startMultipartUpload({ key, contentType });
   const totalParts = Math.ceil(size / MULTIPART_PART_BYTES);
 
+  const now = new Date().toISOString();
   const item = {
     id,
     key,
@@ -1465,8 +1516,13 @@ app.post("/api/bucket/multipart/start", requireOwner, async (req, res) => {
     partSize:MULTIPART_PART_BYTES,
     totalParts,
     status:"UPLOADING",
-    createdAt:new Date().toISOString(),
-    updatedAt:new Date().toISOString()
+    progressPct:0,
+    uploadedParts:0,
+    uploadedBytes:0,
+    lastProgressAt:now,
+    stalledAt:null,
+    createdAt:now,
+    updatedAt:now
   };
   await upsertBucketMedia(item);
 
@@ -1482,7 +1538,7 @@ app.post("/api/bucket/multipart/:id/part-url", requireOwner, async (req, res) =>
   const id = path.basename(String(req.params.id || ""));
   const item = await getBucketMedia(id);
   if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
-  if (!item.uploadId || item.status !== "UPLOADING") {
+  if (!item.uploadId || !["UPLOADING","STALLED"].includes(item.status)) {
     return res.status(409).json({ error:"multipart_upload_not_active" });
   }
 
@@ -1498,6 +1554,53 @@ app.post("/api/bucket/multipart/:id/part-url", requireOwner, async (req, res) =>
     expiresIn:3600
   });
   res.json({ url, partNumber });
+});
+
+app.post("/api/bucket/multipart/:id/progress", requireOwner, async (req, res) => {
+  const id = path.basename(String(req.params.id || ""));
+  let item = await getBucketMedia(id);
+  if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+  if (!item.uploadId || !["UPLOADING","STALLED"].includes(item.status)) {
+    return res.status(409).json({ error:"multipart_upload_not_active" });
+  }
+
+  const partNumber = Math.max(0, Number(req.body?.partNumber || 0));
+  const uploadedBytes = Math.max(0, Number(req.body?.uploadedBytes || 0));
+  const suppliedPct = Number(req.body?.progressPct);
+  const computedPct = item.size ? (uploadedBytes / Number(item.size)) * 100 : 0;
+  const progressPct = Math.max(0, Math.min(100,
+    Number.isFinite(suppliedPct) ? suppliedPct : computedPct
+  ));
+  const wasStalled = item.status === "STALLED";
+  const now = new Date().toISOString();
+
+  item = {
+    ...item,
+    status:"UPLOADING",
+    error:null,
+    stalledAt:null,
+    uploadedParts:Math.max(Number(item.uploadedParts || 0), partNumber),
+    uploadedBytes:Math.max(Number(item.uploadedBytes || 0), uploadedBytes),
+    progressPct:Math.max(Number(item.progressPct || 0), progressPct),
+    lastProgressAt:now,
+    updatedAt:now
+  };
+  await upsertBucketMedia(item);
+
+  if (wasStalled) {
+    void notifyTelegram(`✅ Stream Harbor
+Загрузка возобновилась
+Файл: ${item.originalName || item.id}
+Прогресс: ${Math.round(item.progressPct)}%`);
+  }
+
+  res.json({
+    ok:true,
+    progressPct:item.progressPct,
+    uploadedParts:item.uploadedParts,
+    totalParts:item.totalParts,
+    lastProgressAt:item.lastProgressAt
+  });
 });
 
 app.post("/api/bucket/multipart/:id/complete", requireOwner, async (req, res) => {
@@ -1530,6 +1633,10 @@ app.post("/api/bucket/multipart/:id/complete", requireOwner, async (req, res) =>
     contentType:head.contentType || item.contentType || null,
     status:"ANALYZING",
     error:null,
+    progressPct:100,
+    uploadedParts:Number(item.totalParts || item.uploadedParts || 0),
+    uploadedBytes:Number(head.size || item.size || 0),
+    lastProgressAt:new Date().toISOString(),
     updatedAt:new Date().toISOString()
   };
   await upsertBucketMedia(item);

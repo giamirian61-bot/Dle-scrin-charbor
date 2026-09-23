@@ -107,6 +107,7 @@ function storageCard(m){
     <h3>${esc(m.originalName||m.id)}</h3>
     <div class="storage-meta">
       <div>Status: ${esc(m.status||"UNKNOWN")}</div>
+      ${m.error?'<div class="storage-error">Error: '+esc(m.error)+'</div>':""}
       <div>${esc(v.codec?String(v.codec).toUpperCase():"")} ${v.width&&v.height?esc(v.width+"×"+v.height):""}</div>
       <div>Size: ${fmtMb(m.preparedSize||m.size)}</div>
       ${source?'<div>Source video bitrate: '+esc(source)+' Kbps</div>':""}

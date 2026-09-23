@@ -3,7 +3,11 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   DeleteObjectCommand,
-  PutBucketCorsCommand
+  PutBucketCorsCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
@@ -97,5 +101,64 @@ export async function headBucketObject(key) {
 export async function deleteBucketObject(key) {
   requireBucket();
   await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+  return true;
+}
+
+
+export async function startMultipartUpload({ key, contentType }) {
+  requireBucket();
+  const out = await s3.send(new CreateMultipartUploadCommand({
+    Bucket: BUCKET,
+    Key: key,
+    ContentType: String(contentType || "video/mp4")
+  }));
+  if (!out.UploadId) throw new Error("multipart_upload_id_missing");
+  return { uploadId: out.UploadId };
+}
+
+export async function createMultipartPartUrl({ key, uploadId, partNumber, expiresIn=3600 }) {
+  requireBucket();
+  if (!uploadId) throw new Error("multipart_upload_id_missing");
+  const n = Number(partNumber);
+  if (!Number.isInteger(n) || n < 1 || n > 10000) throw new Error("invalid_part_number");
+  return getSignedUrl(
+    s3,
+    new UploadPartCommand({
+      Bucket: BUCKET,
+      Key: key,
+      UploadId: uploadId,
+      PartNumber: n
+    }),
+    { expiresIn }
+  );
+}
+
+export async function completeMultipartUpload({ key, uploadId, parts }) {
+  requireBucket();
+  const normalized = (parts || []).map(p => ({
+    PartNumber: Number(p.PartNumber),
+    ETag: String(p.ETag || "")
+  })).sort((a,b) => a.PartNumber - b.PartNumber);
+
+  if (!normalized.length || normalized.some(p => !Number.isInteger(p.PartNumber) || p.PartNumber < 1 || !p.ETag)) {
+    throw new Error("invalid_multipart_parts");
+  }
+
+  return s3.send(new CompleteMultipartUploadCommand({
+    Bucket: BUCKET,
+    Key: key,
+    UploadId: uploadId,
+    MultipartUpload: { Parts: normalized }
+  }));
+}
+
+export async function abortMultipartUpload({ key, uploadId }) {
+  requireBucket();
+  if (!uploadId) return false;
+  await s3.send(new AbortMultipartUploadCommand({
+    Bucket: BUCKET,
+    Key: key,
+    UploadId: uploadId
+  }));
   return true;
 }

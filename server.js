@@ -378,6 +378,7 @@ function publicStreamConfig(item, state) {
     name:item.name || `Stream ${item.slotId}`,
     description:item.description || "",
     channelUrl:item.channelUrl || "",
+    rtmpUrl:item.rtmpUrl || YOUTUBE_RTMPS_BASE,
     mediaId:item.mediaId || null,
     keyConfigured:Boolean(decryptSecret(item.keySecret) || streamKeyForSlot(String(item.slotId))),
     createdAt:item.createdAt || null,
@@ -529,7 +530,7 @@ function slotStatusPayload(slotId, desiredState=null) {
   };
 }
 
-async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=0, streamKey=null, streamId=null } = {}) {
+async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=0, streamKey=null, streamId=null, rtmpUrl=null } = {}) {
   const id = String(slotId);
   if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
   if (activeSlots.has(id)) throw new Error("stream_already_active");
@@ -538,7 +539,8 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
   if (!effectiveStreamKey) throw new Error("slot_stream_key_not_configured");
 
   const source = await resolveStreamSource(mediaId);
-  const target = `${YOUTUBE_RTMPS_BASE}/${effectiveStreamKey}`;
+  const baseUrl = String(rtmpUrl || YOUTUBE_RTMPS_BASE).replace(/\/+$/, "");
+  const target = `${baseUrl}/${effectiveStreamKey}`;
 
   const worker = fork("./worker.js", [], {
     env:{
@@ -616,7 +618,8 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
             restore:true,
             retryCount:retryCount + 1,
             streamKey:effectiveStreamKey,
-            streamId
+            streamId,
+            rtmpUrl:baseUrl
           });
         } catch (err) {
           console.error(JSON.stringify({
@@ -1041,6 +1044,7 @@ app.post("/api/streams", requireOwner, async (req, res) => {
     name:String(req.body?.name || `Stream ${slotId}`).slice(0,120),
     description:"",
     channelUrl:"",
+    rtmpUrl:YOUTUBE_RTMPS_BASE,
     mediaId:null,
     keySecret:existingKey ? encryptSecret(existingKey) : null,
     createdAt:now,
@@ -1063,6 +1067,13 @@ app.patch("/api/streams/:id", requireOwner, async (req, res) => {
   if (req.body?.name !== undefined) next.name = String(req.body.name || "").slice(0,120);
   if (req.body?.description !== undefined) next.description = String(req.body.description || "").slice(0,1000);
   if (req.body?.channelUrl !== undefined) next.channelUrl = String(req.body.channelUrl || "").slice(0,500);
+  if (req.body?.rtmpUrl !== undefined) {
+    const value = String(req.body.rtmpUrl || "").trim().slice(0,500);
+    if (value && !/^rtmps?:\/\//i.test(value)) {
+      return res.status(400).json({ error:"invalid_rtmp_url" });
+    }
+    next.rtmpUrl = value || YOUTUBE_RTMPS_BASE;
+  }
 
   if (req.body?.mediaId !== undefined) {
     if (req.body.mediaId === null || req.body.mediaId === "") {
@@ -1117,7 +1128,8 @@ app.post("/api/streams/:id/start", requireOwner, async (req, res) => {
 
     const result = await startStreamInternal(String(item.slotId), item.mediaId, {
       streamKey:key,
-      streamId:item.id
+      streamId:item.id,
+      rtmpUrl:item.rtmpUrl || YOUTUBE_RTMPS_BASE
     });
     res.json({ ok:true, state:"starting", ...result });
   } catch (err) {
@@ -1524,7 +1536,8 @@ const server = app.listen(PORT, "0.0.0.0", () => {
           restore:true,
           retryCount:0,
           streamKey:restoreKey,
-          streamId:desired.streamId || null
+          streamId:desired.streamId || null,
+          rtmpUrl:desired.streamId ? ((await getStreamConfig(desired.streamId))?.rtmpUrl || YOUTUBE_RTMPS_BASE) : YOUTUBE_RTMPS_BASE
         });
         console.log(JSON.stringify({
           event:"slot_restored_after_restart",

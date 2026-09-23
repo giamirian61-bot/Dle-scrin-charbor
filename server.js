@@ -16,10 +16,9 @@ const PORT = 3000;
 const MEDIA_DIR = process.env.MEDIA_DIR || "/data/media";
 const OWNER_TOKEN = process.env.OWNER_TOKEN || "";
 const YOUTUBE_STREAM_KEY = process.env.YOUTUBE_STREAM_KEY || "";
-const YOUTUBE_STREAM_KEY_1 = process.env.YOUTUBE_STREAM_KEY_1 || YOUTUBE_STREAM_KEY;
-const YOUTUBE_STREAM_KEY_2 = process.env.YOUTUBE_STREAM_KEY_2 || "";
 const YOUTUBE_RTMPS_BASE = process.env.YOUTUBE_RTMPS_BASE || "rtmps://a.rtmps.youtube.com/live2";
-const SLOT_IDS = ["1","2"];
+const STREAM_SLOT_COUNT = Math.min(8, Math.max(1, Number(process.env.STREAM_SLOT_COUNT || 2)));
+const SLOT_IDS = Array.from({ length:STREAM_SLOT_COUNT }, (_, i) => String(i + 1));
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 400 * 1024 * 1024);
 const LEGACY_STATE_FILE = path.join(MEDIA_DIR, ".stream-state.json");
 const SLOT_STATE_FILE = path.join(MEDIA_DIR, ".slots-state.json");
@@ -231,17 +230,16 @@ function chooseProfile(summary) {
 }
 
 function streamKeyForSlot(slotId) {
-  if (String(slotId) === "1") return YOUTUBE_STREAM_KEY_1;
-  if (String(slotId) === "2") return YOUTUBE_STREAM_KEY_2;
+  const id = String(slotId);
+  const numbered = process.env[`YOUTUBE_STREAM_KEY_${id}`] || "";
+  if (numbered) return numbered;
+  if (id === "1") return YOUTUBE_STREAM_KEY;
   return "";
 }
 
 function defaultSlotState() {
   return {
-    slots:{
-      "1":{ desired:"stopped" },
-      "2":{ desired:"stopped" }
-    }
+    slots:Object.fromEntries(SLOT_IDS.map(id => [id, { desired:"stopped" }]))
   };
 }
 
@@ -249,10 +247,12 @@ async function readSlotsState() {
   try {
     const parsed = JSON.parse(await fs.readFile(SLOT_STATE_FILE, "utf8"));
     return {
-      slots:{
-        "1":{ desired:"stopped", ...(parsed?.slots?.["1"] || {}) },
-        "2":{ desired:"stopped", ...(parsed?.slots?.["2"] || {}) }
-      }
+      slots:Object.fromEntries(
+        SLOT_IDS.map(id => [
+          id,
+          { desired:"stopped", ...(parsed?.slots?.[id] || {}) }
+        ])
+      )
     };
   } catch {}
 
@@ -260,10 +260,12 @@ async function readSlotsState() {
   try {
     const legacy = JSON.parse(await fs.readFile(LEGACY_STATE_FILE, "utf8"));
     const state = defaultSlotState();
-    state.slots["1"] = {
-      desired:legacy?.desired || "stopped",
-      ...(legacy?.mediaId ? { mediaId:legacy.mediaId } : {})
-    };
+    if (state.slots["1"]) {
+      state.slots["1"] = {
+        desired:legacy?.desired || "stopped",
+        ...(legacy?.mediaId ? { mediaId:legacy.mediaId } : {})
+      };
+    }
     await writeSlotsState(state);
     return state;
   } catch {
@@ -813,7 +815,8 @@ app.get("/health", (_req, res) => res.json({
   streamingSlots:activeSlots.size,
   youtubeKeyConfigured:Boolean(YOUTUBE_STREAM_KEY),
   persistentState:true,
-  preparing:Boolean(prepareJob)
+  preparing:Boolean(prepareJob),
+  slotCount:STREAM_SLOT_COUNT
 }));
 
 app.get("/api/media", requireOwner, async (_req, res) => {

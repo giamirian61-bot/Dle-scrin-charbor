@@ -134,6 +134,23 @@ export async function createMultipartPartUrl({ key, uploadId, partNumber, expire
   );
 }
 
+export async function uploadMultipartPart({ key, uploadId, partNumber, body }) {
+  requireBucket();
+  if (!uploadId) throw new Error("multipart_upload_id_missing");
+  const n = Number(partNumber);
+  if (!Number.isInteger(n) || n < 1 || n > 10000) throw new Error("invalid_part_number");
+  if (!body || !body.length) throw new Error("empty_multipart_part");
+  const out = await s3.send(new UploadPartCommand({
+    Bucket: BUCKET,
+    Key: key,
+    UploadId: uploadId,
+    PartNumber: n,
+    Body: body
+  }));
+  if (!out.ETag) throw new Error("multipart_etag_missing");
+  return { ETag: out.ETag, PartNumber: n };
+}
+
 export async function listMultipartParts({ key, uploadId }) {
   requireBucket();
   if (!uploadId) throw new Error("multipart_upload_id_missing");

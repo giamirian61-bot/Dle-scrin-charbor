@@ -50,7 +50,7 @@ function streamCard(s){
 
     <div class="grid2">
       <div class="field"><label>Name</label><input class="input name" value="${esc(s.name||"")}" placeholder="Stream name"></div>
-      <div class="field"><label>RTMP service</label><input class="input" value="YouTube" disabled></div>
+      <div class="field"><label>RTMPS server</label><input class="input rtmpUrl" value="${esc(s.rtmpUrl||"rtmps://a.rtmps.youtube.com/live2")}" placeholder="rtmps://a.rtmps.youtube.com/live2"></div>
     </div>
 
     <div class="field"><label>Description</label><textarea class="textarea description" placeholder="Description">${esc(s.description||"")}</textarea></div>
@@ -197,6 +197,7 @@ async function saveStream(card,id,silent=false){
     name:card.querySelector(".name").value.trim(),
     description:card.querySelector(".description").value.trim(),
     channelUrl:card.querySelector(".channelUrl").value.trim(),
+    rtmpUrl:card.querySelector(".rtmpUrl").value.trim(),
     mediaId:card.querySelector(".mediaId").value||null
   };
   const key=card.querySelector(".streamKey").value.trim();

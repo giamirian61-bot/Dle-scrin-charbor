@@ -16,6 +16,7 @@ import {
   deleteBucketObject,
   startMultipartUpload,
   createMultipartPartUrl,
+  listMultipartParts,
   completeMultipartUpload,
   abortMultipartUpload
 } from "./bucket-storage.js";
@@ -627,26 +628,85 @@ const UPLOAD_STALL_MS = Math.max(2 * 60 * 1000, Number(process.env.UPLOAD_STALL_
 async function scanStalledUploads() {
   const state = await readBucketMediaState();
   const now = Date.now();
+
   for (const item of state.items) {
-    if (!item?.uploadId || item.status !== "UPLOADING") continue;
-    const last = Date.parse(item.lastProgressAt || item.updatedAt || item.createdAt || "");
-    if (!Number.isFinite(last) || now - last < UPLOAD_STALL_MS) continue;
+    if (!item?.uploadId || !["UPLOADING","STALLED"].includes(item.status)) continue;
+
+    let uploadedParts = Number(item.uploadedParts || 0);
+    let uploadedBytes = Number(item.uploadedBytes || 0);
+    let latestPartAt = null;
+
+    try {
+      const remote = await listMultipartParts({ key:item.key, uploadId:item.uploadId });
+      uploadedParts = remote.parts.length;
+      uploadedBytes = remote.parts.reduce((sum, p) => sum + Number(p.size || 0), 0);
+      latestPartAt = remote.parts
+        .map(p => Date.parse(p.lastModified || ""))
+        .filter(Number.isFinite)
+        .sort((a,b) => b-a)[0] || null;
+    } catch (err) {
+      console.error(JSON.stringify({
+        event:"multipart_progress_probe_failed",
+        mediaId:item.id,
+        error:sanitizeLog(err?.message || err)
+      }));
+      continue;
+    }
+
+    const previousParts = Number(item.uploadedParts || 0);
+    const previousBytes = Number(item.uploadedBytes || 0);
+    const progressed = uploadedParts > previousParts || uploadedBytes > previousBytes;
+    const pct = item.size ? Math.max(0, Math.min(100, (uploadedBytes / Number(item.size)) * 100)) : 0;
+
+    if (progressed) {
+      const progressAt = new Date(latestPartAt || now).toISOString();
+      const wasStalled = item.status === "STALLED";
+      await upsertBucketMedia({
+        ...item,
+        status:"UPLOADING",
+        error:null,
+        stalledAt:null,
+        uploadedParts,
+        uploadedBytes,
+        progressPct:pct,
+        lastProgressAt:progressAt,
+        updatedAt:new Date().toISOString()
+      });
+
+      if (wasStalled) {
+        void notifyTelegram(`✅ Stream Harbor
+Загрузка снова движется
+Файл: ${item.originalName || item.id}
+Прогресс: ${Math.round(pct)}%`);
+      }
+      continue;
+    }
+
+    const last = Math.max(
+      Date.parse(item.lastProgressAt || "") || 0,
+      latestPartAt || 0,
+      Date.parse(item.updatedAt || item.createdAt || "") || 0
+    );
+    if (!last || now - last < UPLOAD_STALL_MS || item.status === "STALLED") continue;
 
     const stalledAt = new Date().toISOString();
     await upsertBucketMedia({
       ...item,
       status:"STALLED",
+      progressPct:pct,
+      uploadedParts,
+      uploadedBytes,
       stalledAt,
       error:"upload_stalled",
       updatedAt:stalledAt
     });
 
-    const pct = Number.isFinite(Number(item.progressPct)) ? Math.round(Number(item.progressPct)) : 0;
     const quietMin = Math.max(1, Math.round((now - last) / 60000));
     void notifyTelegram(`🚨 Stream Harbor
 Загрузка зависла
 Файл: ${item.originalName || item.id}
-Прогресс: ${pct}%
+Прогресс: ${Math.round(pct)}%
+Загружено частей: ${uploadedParts}/${item.totalParts || "?"}
 Нет движения: ${quietMin} мин.
 Нужно проверить соединение и при необходимости перезапустить загрузку.`);
   }
@@ -1526,6 +1586,12 @@ app.post("/api/bucket/multipart/start", requireOwner, async (req, res) => {
   };
   await upsertBucketMedia(item);
 
+  void notifyTelegram(`📤 Stream Harbor
+Началась загрузка
+Файл: ${originalName}
+Размер: ${(size/1024/1024).toFixed(1)} MB
+Частей: ${totalParts}`);
+
   res.status(201).json({
     id,
     partSize:MULTIPART_PART_BYTES,
@@ -1660,6 +1726,10 @@ app.post("/api/bucket/multipart/:id/abort", requireOwner, async (req, res) => {
     error:"upload_aborted",
     updatedAt:new Date().toISOString()
   });
+  void notifyTelegram(`🚨 Stream Harbor
+Загрузка прервана
+Файл: ${item.originalName || item.id}
+Последний прогресс: ${Math.round(Number(item.progressPct || 0))}%`);
   res.json({ ok:true });
 });
 

@@ -109,6 +109,48 @@ async function probeFile(filePath) {
   return JSON.parse(stdout);
 }
 
+async function probeKeyframes(filePath) {
+  const { stdout } = await execFileAsync("ffprobe", [
+    "-v","error",
+    "-select_streams","v:0",
+    "-skip_frame","nokey",
+    "-show_entries","frame=pts_time",
+    "-of","csv=p=0",
+    filePath
+  ], { timeout: 120_000, maxBuffer: 20 * 1024 * 1024 });
+
+  const times = stdout
+    .split(/\r?\n/)
+    .map(line => Number(line.replace(/[^0-9.+-]/g, "")))
+    .filter(Number.isFinite);
+
+  let maxGap = null;
+  if (times.length >= 2) {
+    maxGap = 0;
+    for (let i = 1; i < times.length; i++) {
+      maxGap = Math.max(maxGap, times[i] - times[i - 1]);
+    }
+  }
+
+  return {
+    keyframeCount:times.length,
+    maxKeyframeGap:maxGap
+  };
+}
+
+async function analyzeFile(filePath) {
+  const probe = await probeFile(filePath);
+  const summary = summarizeProbe(probe);
+  const keyframes = summary.video ? await probeKeyframes(filePath) : {
+    keyframeCount:0,
+    maxKeyframeGap:null
+  };
+  return {
+    ...summary,
+    keyframes
+  };
+}
+
 function summarizeProbe(probe) {
   const streams = probe.streams || [];
   const video = streams.find(s => s.codec_type === "video");
@@ -142,20 +184,29 @@ function parseFps(rate) {
 function chooseProfile(summary) {
   const v = summary.video;
   const a = summary.audio;
-  if (!v) return { compatible:false, mode:"transcode", reason:"no_video" };
+  if (!v) return {
+    streamReady:false,
+    mode:"prepare",
+    reason:"no_video"
+  };
 
   const fps = parseFps(v.frameRate);
-  const directCompatible =
+  const keyframeGap = summary.keyframes?.maxKeyframeGap;
+  const codecReady =
     v.codec === "h264" &&
     v.pixFmt === "yuv420p" &&
     fps > 0 && fps <= 60 &&
     (!a || a.codec === "aac");
 
-  if (directCompatible) {
+  const gopReady =
+    Number.isFinite(keyframeGap) &&
+    keyframeGap <= 2.2;
+
+  if (codecReady && gopReady) {
     return {
-      compatible:true,
+      streamReady:true,
       mode:"copy",
-      reason:"h264_aac_passthrough",
+      reason:"youtube_ready_passthrough",
       targetVideoBitrate:null
     };
   }
@@ -167,10 +218,11 @@ function chooseProfile(summary) {
   else if (shortSide >= 480) kbps = 1500;
 
   return {
-    compatible:false,
-    mode:"transcode",
-    reason:"normalization_required",
-    targetVideoBitrate:kbps
+    streamReady:false,
+    mode:"prepare",
+    reason:!codecReady ? "codec_normalization_required" : "keyframe_interval_too_long",
+    targetVideoBitrate:kbps,
+    detectedMaxKeyframeGap:keyframeGap
   };
 }
 
@@ -206,6 +258,7 @@ async function writeMeta(id, meta) {
 
 let active = null;
 let restartTimer = null;
+let prepareJob = null;
 
 function buildFfmpegArgs(filePath, profile, target) {
   const common = [
@@ -260,16 +313,45 @@ async function startStreamInternal(mediaId, { restore=false, retryCount=0 } = {}
   const id = path.basename(String(mediaId || ""));
   if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
 
-  const filePath = path.join(MEDIA_DIR, id);
-  await fs.access(filePath);
+  const sourcePath = path.join(MEDIA_DIR, id);
+  await fs.access(sourcePath);
 
-  const probe = await probeFile(filePath);
-  const summary = summarizeProbe(probe);
-  if (!summary.video) throw new Error("media_probe_failed");
+  let meta = await readMeta(id);
+  if (!meta?.probe || !meta?.profile) {
+    const analysis = await analyzeFile(sourcePath);
+    meta = {
+      ...(meta || {}),
+      id,
+      originalName:meta?.originalName || id,
+      size:(await fs.stat(sourcePath)).size,
+      status:profile.streamReady ? "READY_DIRECT" : "PREPARE_NEEDED",
+      createdAt:meta?.createdAt || new Date().toISOString(),
+      probe:analysis,
+      profile:chooseProfile(analysis)
+    };
+    await writeMeta(id, meta);
+  }
 
-  const profile = chooseProfile(summary);
+  let streamPath = sourcePath;
+  let streamProbe = meta.probe;
+  let profile = meta.profile;
+
+  if (meta.preparedId) {
+    const preparedPath = path.join(MEDIA_DIR, meta.preparedId);
+    try {
+      await fs.access(preparedPath);
+      streamPath = preparedPath;
+      streamProbe = meta.preparedProbe || await analyzeFile(preparedPath);
+      profile = chooseProfile(streamProbe);
+    } catch {}
+  }
+
+  if (!profile?.streamReady || profile.mode !== "copy") {
+    throw new Error("media_requires_preparation");
+  }
+
   const target = `${YOUTUBE_RTMPS_BASE}/${YOUTUBE_STREAM_KEY}`;
-  const args = buildFfmpegArgs(filePath, profile, target);
+  const args = buildFfmpegArgs(streamPath, profile, target);
 
   const child = spawn("ffmpeg", args, {
     stdio: ["ignore","ignore","pipe"],
@@ -291,7 +373,7 @@ async function startStreamInternal(mediaId, { restore=false, retryCount=0 } = {}
     child,
     mode:profile.mode,
     profile,
-    probe:summary,
+    probe:streamProbe,
     metrics,
     lastError:null,
     intentionalStop:false,
@@ -380,6 +462,128 @@ async function startStreamInternal(mediaId, { restore=false, retryCount=0 } = {}
   };
 }
 
+async function prepareMedia(mediaId) {
+  if (prepareJob) throw new Error("prepare_job_already_active");
+  if (active) throw new Error("cannot_prepare_while_streaming");
+
+  const id = path.basename(String(mediaId || ""));
+  if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
+
+  const sourcePath = path.join(MEDIA_DIR, id);
+  await fs.access(sourcePath);
+
+  const sourceAnalysis = await analyzeFile(sourcePath);
+  const sourceProfile = chooseProfile(sourceAnalysis);
+
+  let meta = await readMeta(id) || {
+    id,
+    originalName:id,
+    size:(await fs.stat(sourcePath)).size,
+    createdAt:new Date().toISOString()
+  };
+
+  if (sourceProfile.streamReady) {
+    meta = {
+      ...meta,
+      status:"READY_DIRECT",
+      probe:sourceAnalysis,
+      profile:sourceProfile,
+      preparedId:null,
+      preparedProbe:null
+    };
+    await writeMeta(id, meta);
+    return {
+      state:"already_ready",
+      mediaId:id,
+      profile:sourceProfile
+    };
+  }
+
+  const preparedId = id + ".ready.mp4";
+  const preparedPath = path.join(MEDIA_DIR, preparedId);
+  const kbps = Number(sourceProfile.targetVideoBitrate || 2500);
+
+  const args = [
+    "-y",
+    "-i",sourcePath,
+    "-map","0:v:0",
+    "-map","0:a:0?",
+    "-c:v","libx264",
+    "-preset","veryfast",
+    "-pix_fmt","yuv420p",
+    "-r","30",
+    "-g","60",
+    "-keyint_min","60",
+    "-sc_threshold","0",
+    "-b:v",`${kbps}k`,
+    "-maxrate",`${kbps}k`,
+    "-bufsize",`${kbps * 2}k`,
+    "-c:a","aac",
+    "-b:a","128k",
+    "-ar","48000",
+    "-movflags","+faststart",
+    preparedPath
+  ];
+
+  const child = spawn("ffmpeg", args, {
+    stdio:["ignore","ignore","pipe"],
+    shell:false
+  });
+
+  const job = {
+    mediaId:id,
+    preparedId,
+    pid:child.pid,
+    startedAt:new Date().toISOString(),
+    state:"preparing",
+    lastError:null,
+    child
+  };
+  prepareJob = job;
+
+  child.stderr.on("data", chunk => {
+    const line = sanitizeLog(chunk.toString("utf8"));
+    if (line.trim()) job.lastError = line.slice(-800);
+  });
+
+  const exit = await new Promise(resolve => {
+    child.on("exit", (code, signal) => resolve({ code, signal }));
+  });
+
+  if (prepareJob?.pid === child.pid) prepareJob = null;
+
+  if (exit.code !== 0) {
+    await fs.unlink(preparedPath).catch(() => {});
+    throw new Error("prepare_failed");
+  }
+
+  const preparedProbe = await analyzeFile(preparedPath);
+  const preparedProfile = chooseProfile(preparedProbe);
+  if (!preparedProfile.streamReady) {
+    await fs.unlink(preparedPath).catch(() => {});
+    throw new Error("prepared_file_not_stream_ready");
+  }
+
+  meta = {
+    ...meta,
+    status:"READY_DIRECT",
+    probe:sourceAnalysis,
+    profile:sourceProfile,
+    preparedId,
+    preparedProbe,
+    preparedProfile,
+    preparedAt:new Date().toISOString()
+  };
+  await writeMeta(id, meta);
+
+  return {
+    state:"ready_direct",
+    mediaId:id,
+    preparedId,
+    preparedProfile
+  };
+}
+
 async function stopActiveStream() {
   clearTimeout(restartTimer);
   restartTimer = null;
@@ -412,6 +616,7 @@ async function listMedia() {
     if (
       name === path.basename(STATE_FILE) ||
       name.endsWith(".meta.json") ||
+      name.endsWith(".ready.mp4") ||
       name.startsWith(".")
     ) continue;
 
@@ -419,12 +624,42 @@ async function listMedia() {
     const st = await fs.stat(full).catch(() => null);
     if (!st?.isFile()) continue;
 
-    const meta = await readMeta(name);
+    let meta = await readMeta(name);
+    if (!meta?.probe || !meta?.profile) {
+      try {
+        const analysis = await analyzeFile(full);
+        meta = {
+          ...(meta || {}),
+          id:name,
+          size:st.size,
+          originalName:meta?.originalName || name,
+          status:chooseProfile(analysis).streamReady ? "READY_DIRECT" : "PREPARE_NEEDED",
+          createdAt:meta?.createdAt || new Date(st.birthtimeMs || Date.now()).toISOString(),
+          probe:analysis,
+          profile:chooseProfile(analysis)
+        };
+        await writeMeta(name, meta);
+      } catch (err) {
+        meta = {
+          id:name,
+          size:st.size,
+          originalName:name,
+          status:"ERROR",
+          error:sanitizeLog(err?.message || err)
+        };
+      }
+    }
+
     items.push({
       id:name,
       size:st.size,
       originalName:meta?.originalName || name,
+      status:meta?.preparedId ? "READY_DIRECT" : (meta?.profile?.streamReady ? "READY_DIRECT" : meta?.status || "PREPARE_NEEDED"),
       probe:meta?.probe || null,
+      profile:meta?.profile || null,
+      preparedId:meta?.preparedId || null,
+      preparedProbe:meta?.preparedProbe || null,
+      preparedProfile:meta?.preparedProfile || null,
       createdAt:meta?.createdAt || null
     });
   }
@@ -437,7 +672,8 @@ app.get("/health", (_req, res) => res.json({
   ffmpeg:true,
   streaming:Boolean(active),
   youtubeKeyConfigured:Boolean(YOUTUBE_STREAM_KEY),
-  persistentState:true
+  persistentState:true,
+  preparing:Boolean(prepareJob)
 }));
 
 app.get("/api/media", requireOwner, async (_req, res) => {
@@ -448,8 +684,7 @@ app.post("/api/media", requireOwner, upload.single("file"), async (req, res) => 
   if (!req.file) return res.status(400).json({ error:"file_required" });
 
   try {
-    const probe = await probeFile(req.file.path);
-    const summary = summarizeProbe(probe);
+    const summary = await analyzeFile(req.file.path);
     if (!summary.video) throw new Error("No video stream detected");
 
     const originalName = normalizeOriginalName(req.file.originalname);
@@ -459,7 +694,7 @@ app.post("/api/media", requireOwner, upload.single("file"), async (req, res) => 
       id:req.file.filename,
       originalName,
       size:req.file.size,
-      status:"READY",
+      status:profile.streamReady ? "READY_DIRECT" : "PREPARE_NEEDED",
       createdAt:new Date().toISOString(),
       probe:summary,
       profile
@@ -492,6 +727,34 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
   res.json({ ok:true });
 });
 
+app.post("/api/media/:id/prepare", requireOwner, async (req, res) => {
+  try {
+    const result = await prepareMedia(req.params.id);
+    res.json({ ok:true, ...result });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    const status =
+      msg === "prepare_job_already_active" ? 409 :
+      msg === "cannot_prepare_while_streaming" ? 409 :
+      msg === "invalid_media_id" ? 400 :
+      msg === "media_requires_preparation" ? 409 :
+      msg.includes("ENOENT") ? 404 : 422;
+    res.status(status).json({ error:msg });
+  }
+});
+
+app.get("/api/prepare/status", requireOwner, (_req, res) => {
+  if (!prepareJob) return res.json({ state:"idle" });
+  res.json({
+    state:prepareJob.state,
+    mediaId:prepareJob.mediaId,
+    preparedId:prepareJob.preparedId,
+    pid:prepareJob.pid,
+    startedAt:prepareJob.startedAt,
+    lastError:prepareJob.lastError
+  });
+});
+
 app.post("/api/stream/start", requireOwner, async (req, res) => {
   try {
     const result = await startStreamInternal(req.body?.mediaId);
@@ -518,11 +781,13 @@ app.post("/api/stream/stop", requireOwner, async (_req, res) => {
 
 app.get("/api/stream/status", requireOwner, async (_req, res) => {
   const desired = await readState();
+  const preparation = prepareJob ? {state:prepareJob.state,mediaId:prepareJob.mediaId,startedAt:prepareJob.startedAt} : {state:"idle"};
 
   if (!active) {
     return res.json({
       state:"idle",
-      desired:desired.desired || "stopped"
+      desired:desired.desired || "stopped",
+      preparation
     });
   }
 
@@ -535,7 +800,8 @@ app.get("/api/stream/status", requireOwner, async (_req, res) => {
     mode:active.mode,
     profile:active.profile,
     metrics:active.metrics,
-    lastError:active.lastError
+    lastError:active.lastError,
+    preparation
   });
 });
 
@@ -572,8 +838,7 @@ app.post("/test-upload", requireOwner, upload.single("file"), async (req, res) =
   if (!req.file) return res.status(400).send("Файл не выбран");
 
   try {
-    const probe = await probeFile(req.file.path);
-    const summary = summarizeProbe(probe);
+    const summary = await analyzeFile(req.file.path);
     if (!summary.video) throw new Error("No video stream detected");
 
     const originalName = normalizeOriginalName(req.file.originalname);
@@ -583,7 +848,7 @@ app.post("/test-upload", requireOwner, upload.single("file"), async (req, res) =
       id:req.file.filename,
       originalName,
       size:req.file.size,
-      status:"READY",
+      status:profile.streamReady ? "READY_DIRECT" : "PREPARE_NEEDED",
       createdAt:new Date().toISOString(),
       probe:summary,
       profile
@@ -657,6 +922,22 @@ async function startStream(id){
     refreshStatus();
   }
 }
+async function prepareMediaUi(id){
+  if(!confirm("Подготовить файл один раз для стабильного DIRECT-стрима?")) return;
+  const statusEl=document.getElementById("status");
+  statusEl.textContent="Подготовка файла... Это может занять несколько минут.";
+  try{
+    const d=await api("/api/media/"+encodeURIComponent(id)+"/prepare",{
+      method:"POST",
+      body:"{}"
+    });
+    statusEl.textContent=JSON.stringify(d,null,2);
+    setTimeout(()=>location.reload(),1200);
+  }catch(e){
+    alert(e.message);
+    refreshStatus();
+  }
+}
 async function stopStream(){
   if(!confirm("Остановить поток?")) return;
   try{
@@ -671,6 +952,9 @@ async function stopStream(){
 document.querySelectorAll(".startBtn").forEach(btn => {
   btn.addEventListener("click", () => startStream(btn.dataset.mediaId));
 });
+document.querySelectorAll(".prepareBtn").forEach(btn => {
+  btn.addEventListener("click", () => prepareMediaUi(btn.dataset.mediaId));
+});
 document.getElementById("stopBtn")?.addEventListener("click", stopStream);
 refreshStatus();
 setInterval(refreshStatus,5000);
@@ -680,15 +964,30 @@ setInterval(refreshStatus,5000);
 app.get("/test-control", requireOwner, async (_req, res) => {
   const files = await listMedia();
 
-  const rows = files.map(f => `
-    <div class="file">
-      <div>
-        <b>${escapeHtml(f.originalName || f.id)}</b><br>
-        <small>${escapeHtml(f.id)} · ${(f.size/1024/1024).toFixed(1)} MB</small>
-      </div>
-      <button class="startBtn" data-media-id="${escapeHtml(f.id)}">Start stream</button>
-    </div>`
-  ).join("");
+  const rows = files.map(f => {
+    const ready = f.status === "READY_DIRECT";
+    const sourceProfile = f.profile || {};
+    const gap = f.probe?.keyframes?.maxKeyframeGap;
+    const info = [
+      f.status,
+      sourceProfile.reason || "",
+      Number.isFinite(gap) ? `GOP max ${gap.toFixed(2)}s` : "",
+      `${(f.size/1024/1024).toFixed(1)} MB`
+    ].filter(Boolean).join(" · ");
+
+    const action = ready
+      ? `<button class="startBtn" data-media-id="${escapeHtml(f.id)}">Start stream</button>`
+      : `<button class="prepareBtn" data-media-id="${escapeHtml(f.id)}">Prepare once</button>`;
+
+    return `
+      <div class="file">
+        <div>
+          <b>${escapeHtml(f.originalName || f.id)}</b><br>
+          <small>${escapeHtml(info)}</small>
+        </div>
+        ${action}
+      </div>`;
+  }).join("");
 
   res.type("html").send(`<!doctype html>
 <html lang="ru">

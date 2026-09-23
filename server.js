@@ -22,6 +22,7 @@ const SLOT_IDS = Array.from({ length:STREAM_SLOT_COUNT }, (_, i) => String(i + 1
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 400 * 1024 * 1024);
 const LEGACY_STATE_FILE = path.join(MEDIA_DIR, ".stream-state.json");
 const SLOT_STATE_FILE = path.join(MEDIA_DIR, ".slots-state.json");
+const STREAM_CONFIGS_FILE = path.join(MEDIA_DIR, ".stream-configs.json");
 
 await fs.mkdir(MEDIA_DIR, { recursive: true });
 
@@ -82,7 +83,11 @@ function escapeHtml(value) {
 
 function sanitizeLog(value) {
   let s = String(value ?? "");
-  if (YOUTUBE_STREAM_KEY) s = s.split(YOUTUBE_STREAM_KEY).join("[REDACTED]");
+  const secrets = new Set([
+    YOUTUBE_STREAM_KEY,
+    ...SLOT_IDS.map(id => process.env[`YOUTUBE_STREAM_KEY_${id}`] || "")
+  ].filter(Boolean));
+  for (const secret of secrets) s = s.split(secret).join("[REDACTED]");
   return s;
 }
 
@@ -288,6 +293,99 @@ async function updateSlotState(slotId, patch) {
   return state.slots[id];
 }
 
+function dashboardCryptoKey() {
+  return crypto
+    .createHash("sha256")
+    .update("stream-harbor-dashboard:" + OWNER_TOKEN)
+    .digest();
+}
+
+function encryptSecret(secret) {
+  if (!secret) return null;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", dashboardCryptoKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(String(secret), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    v:1,
+    iv:iv.toString("base64"),
+    tag:tag.toString("base64"),
+    data:encrypted.toString("base64")
+  };
+}
+
+function decryptSecret(payload) {
+  if (!payload?.iv || !payload?.tag || !payload?.data) return "";
+  try {
+    const decipher = crypto.createDecipheriv(
+      "aes-256-gcm",
+      dashboardCryptoKey(),
+      Buffer.from(payload.iv, "base64")
+    );
+    decipher.setAuthTag(Buffer.from(payload.tag, "base64"));
+    return Buffer.concat([
+      decipher.update(Buffer.from(payload.data, "base64")),
+      decipher.final()
+    ]).toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+async function writeStreamConfigs(items) {
+  const tmp = STREAM_CONFIGS_FILE + ".tmp";
+  await fs.writeFile(tmp, JSON.stringify({ items }, null, 2), "utf8");
+  await fs.rename(tmp, STREAM_CONFIGS_FILE);
+}
+
+async function readStreamConfigs() {
+  try {
+    const parsed = JSON.parse(await fs.readFile(STREAM_CONFIGS_FILE, "utf8"));
+    return Array.isArray(parsed?.items) ? parsed.items : [];
+  } catch {}
+
+  // Migration: create the first card from the already working slot 1.
+  const items = [];
+  if (SLOT_IDS.includes("1")) {
+    const legacyKey = streamKeyForSlot("1");
+    items.push({
+      id:crypto.randomUUID(),
+      slotId:"1",
+      name:"Stream 1",
+      description:"",
+      channelUrl:"",
+      mediaId:null,
+      keySecret:legacyKey ? encryptSecret(legacyKey) : null,
+      createdAt:new Date().toISOString(),
+      updatedAt:new Date().toISOString()
+    });
+  }
+  await writeStreamConfigs(items);
+  return items;
+}
+
+async function getStreamConfig(streamId) {
+  const items = await readStreamConfigs();
+  return items.find(item => item.id === String(streamId)) || null;
+}
+
+function publicStreamConfig(item, state) {
+  const slotState = state?.slots?.[String(item.slotId)] || { desired:"stopped" };
+  const runtime = slotStatusPayload(String(item.slotId), slotState);
+  return {
+    id:item.id,
+    slotId:String(item.slotId),
+    name:item.name || `Stream ${item.slotId}`,
+    description:item.description || "",
+    channelUrl:item.channelUrl || "",
+    mediaId:item.mediaId || null,
+    keyConfigured:Boolean(decryptSecret(item.keySecret) || streamKeyForSlot(String(item.slotId))),
+    createdAt:item.createdAt || null,
+    updatedAt:item.updatedAt || null,
+    runtime
+  };
+}
+
 async function readMeta(id) {
   try {
     return JSON.parse(await fs.readFile(path.join(MEDIA_DIR, id + ".meta.json"), "utf8"));
@@ -410,6 +508,7 @@ function slotStatusPayload(slotId, desiredState=null) {
       state:"idle",
       desired:desired?.desired || "stopped",
       mediaId:desired?.mediaId || null,
+      streamId:desired?.streamId || null,
       keyConfigured:Boolean(streamKeyForSlot(id))
     };
   }
@@ -421,6 +520,7 @@ function slotStatusPayload(slotId, desiredState=null) {
     keyConfigured:Boolean(streamKeyForSlot(id)),
     pid:active.pid,
     mediaId:active.file,
+    streamId:active.streamId || desired?.streamId || null,
     startedAt:active.startedAt,
     mode:active.mode,
     profile:active.profile,
@@ -429,16 +529,16 @@ function slotStatusPayload(slotId, desiredState=null) {
   };
 }
 
-async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=0 } = {}) {
+async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=0, streamKey=null, streamId=null } = {}) {
   const id = String(slotId);
   if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
   if (activeSlots.has(id)) throw new Error("stream_already_active");
 
-  const streamKey = streamKeyForSlot(id);
-  if (!streamKey) throw new Error("slot_stream_key_not_configured");
+  const effectiveStreamKey = streamKey || streamKeyForSlot(id);
+  if (!effectiveStreamKey) throw new Error("slot_stream_key_not_configured");
 
   const source = await resolveStreamSource(mediaId);
-  const target = `${YOUTUBE_RTMPS_BASE}/${streamKey}`;
+  const target = `${YOUTUBE_RTMPS_BASE}/${effectiveStreamKey}`;
 
   const worker = fork("./worker.js", [], {
     env:{
@@ -467,7 +567,8 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
     },
     lastError:null,
     intentionalStop:false,
-    retryCount
+    retryCount,
+    streamId:streamId || null
   };
   activeSlots.set(id, active);
 
@@ -513,7 +614,9 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
         try {
           await startStreamInternal(id, source.id, {
             restore:true,
-            retryCount:retryCount + 1
+            retryCount:retryCount + 1,
+            streamKey:effectiveStreamKey,
+            streamId
           });
         } catch (err) {
           console.error(JSON.stringify({
@@ -533,6 +636,7 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
     await updateSlotState(id, {
       desired:"running",
       mediaId:source.id,
+      streamId:streamId || null,
       requestedAt:new Date().toISOString()
     });
   }
@@ -557,6 +661,7 @@ async function stopSlot(slotId) {
 
   await updateSlotState(id, {
     desired:"stopped",
+    streamId:null,
     stoppedAt:new Date().toISOString()
   });
 
@@ -916,6 +1021,117 @@ function streamErrorStatus(msg) {
     msg.includes("ENOENT") ? 404 : 422;
 }
 
+app.get("/api/streams", requireOwner, async (_req, res) => {
+  const items = await readStreamConfigs();
+  const state = await readSlotsState();
+  res.json({ items:items.map(item => publicStreamConfig(item, state)) });
+});
+
+app.post("/api/streams", requireOwner, async (req, res) => {
+  const items = await readStreamConfigs();
+  const used = new Set(items.map(item => String(item.slotId)));
+  const slotId = SLOT_IDS.find(id => !used.has(id));
+  if (!slotId) return res.status(409).json({ error:"no_stream_slot_available" });
+
+  const existingKey = streamKeyForSlot(slotId);
+  const now = new Date().toISOString();
+  const item = {
+    id:crypto.randomUUID(),
+    slotId,
+    name:String(req.body?.name || `Stream ${slotId}`).slice(0,120),
+    description:"",
+    channelUrl:"",
+    mediaId:null,
+    keySecret:existingKey ? encryptSecret(existingKey) : null,
+    createdAt:now,
+    updatedAt:now
+  };
+  items.push(item);
+  await writeStreamConfigs(items);
+  const state = await readSlotsState();
+  res.status(201).json(publicStreamConfig(item, state));
+});
+
+app.patch("/api/streams/:id", requireOwner, async (req, res) => {
+  const items = await readStreamConfigs();
+  const idx = items.findIndex(item => item.id === String(req.params.id));
+  if (idx < 0) return res.status(404).json({ error:"stream_not_found" });
+
+  const current = items[idx];
+  const next = { ...current };
+
+  if (req.body?.name !== undefined) next.name = String(req.body.name || "").slice(0,120);
+  if (req.body?.description !== undefined) next.description = String(req.body.description || "").slice(0,1000);
+  if (req.body?.channelUrl !== undefined) next.channelUrl = String(req.body.channelUrl || "").slice(0,500);
+
+  if (req.body?.mediaId !== undefined) {
+    if (req.body.mediaId === null || req.body.mediaId === "") {
+      next.mediaId = null;
+    } else {
+      const mediaId = path.basename(String(req.body.mediaId));
+      await fs.access(path.join(MEDIA_DIR, mediaId));
+      next.mediaId = mediaId;
+    }
+  }
+
+  if (req.body?.streamKey) {
+    next.keySecret = encryptSecret(String(req.body.streamKey).trim());
+  }
+
+  next.updatedAt = new Date().toISOString();
+  items[idx] = next;
+  await writeStreamConfigs(items);
+
+  const state = await readSlotsState();
+  res.json(publicStreamConfig(next, state));
+});
+
+app.delete("/api/streams/:id", requireOwner, async (req, res) => {
+  const items = await readStreamConfigs();
+  const idx = items.findIndex(item => item.id === String(req.params.id));
+  if (idx < 0) return res.status(404).json({ error:"stream_not_found" });
+
+  const item = items[idx];
+  if (activeSlots.has(String(item.slotId))) {
+    return res.status(409).json({ error:"stream_is_running" });
+  }
+
+  items.splice(idx, 1);
+  await writeStreamConfigs(items);
+  await updateSlotState(String(item.slotId), {
+    desired:"stopped",
+    streamId:null,
+    mediaId:null
+  });
+  res.json({ ok:true });
+});
+
+app.post("/api/streams/:id/start", requireOwner, async (req, res) => {
+  try {
+    const item = await getStreamConfig(req.params.id);
+    if (!item) return res.status(404).json({ error:"stream_not_found" });
+    if (!item.mediaId) return res.status(409).json({ error:"stream_media_not_selected" });
+
+    const key = decryptSecret(item.keySecret) || streamKeyForSlot(String(item.slotId));
+    if (!key) return res.status(409).json({ error:"stream_key_not_configured" });
+
+    const result = await startStreamInternal(String(item.slotId), item.mediaId, {
+      streamKey:key,
+      streamId:item.id
+    });
+    res.json({ ok:true, state:"starting", ...result });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    res.status(streamErrorStatus(msg)).json({ error:msg });
+  }
+});
+
+app.post("/api/streams/:id/stop", requireOwner, async (req, res) => {
+  const item = await getStreamConfig(req.params.id);
+  if (!item) return res.status(404).json({ error:"stream_not_found" });
+  res.json(await stopSlot(String(item.slotId)));
+});
+
 app.get("/api/slots", requireOwner, async (_req, res) => {
   const state = await readSlotsState();
   const preparation = prepareJob
@@ -983,6 +1199,20 @@ app.get("/api/stream/status", requireOwner, async (_req, res) => {
       ? { state:prepareJob.state, mediaId:prepareJob.mediaId, startedAt:prepareJob.startedAt }
       : { state:"idle" }
   });
+});
+
+app.get("/", requireOwner, (_req, res) => res.redirect("/app"));
+
+app.get("/app", requireOwner, (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "dashboard.html"));
+});
+
+app.get("/dashboard.css", requireOwner, (_req, res) => {
+  res.type("text/css").sendFile(path.join(process.cwd(), "dashboard.css"));
+});
+
+app.get("/dashboard.js", requireOwner, (_req, res) => {
+  res.type("application/javascript").sendFile(path.join(process.cwd(), "dashboard.js"));
 });
 
 app.get("/test-upload", requireOwner, (_req, res) => {
@@ -1284,9 +1514,17 @@ const server = app.listen(PORT, "0.0.0.0", () => {
       if (desired.desired !== "running" || !desired.mediaId || activeSlots.has(slotId)) continue;
 
       try {
+        let restoreKey = null;
+        if (desired.streamId) {
+          const streamConfig = await getStreamConfig(desired.streamId);
+          restoreKey = streamConfig ? (decryptSecret(streamConfig.keySecret) || streamKeyForSlot(slotId)) : null;
+        }
+
         await startStreamInternal(slotId, desired.mediaId, {
           restore:true,
-          retryCount:0
+          retryCount:0,
+          streamKey:restoreKey,
+          streamId:desired.streamId || null
         });
         console.log(JSON.stringify({
           event:"slot_restored_after_restart",

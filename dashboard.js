@@ -123,22 +123,71 @@ function renderStorage(){
 function wireStreams(){
   document.querySelectorAll(".stream-card").forEach(card=>{
     const id=card.dataset.id;
+
     card.querySelector(".eye").addEventListener("click",()=>{
-      const inp=card.querySelector(".streamKey"); inp.type=inp.type==="password"?"text":"password";
+      const inp=card.querySelector(".streamKey");
+      inp.type=inp.type==="password"?"text":"password";
     });
+
+    card.querySelector(".mediaId").addEventListener("change",async e=>{
+      const mediaId=e.target.value||null;
+      try{
+        await api("/api/streams/"+encodeURIComponent(id),{
+          method:"PATCH",
+          body:JSON.stringify({mediaId})
+        });
+
+        const media=state.media.find(m=>m.id===mediaId);
+        const meta=card.querySelector(".media-meta");
+        if(meta){
+          meta.textContent=media
+            ? (media.originalName||media.id)+" · "+media.status+" · "+fmtMb(media.preparedSize||media.size)
+            : "No video selected";
+        }
+
+        const stream=state.streams.find(s=>s.id===id);
+        if(stream) stream.mediaId=mediaId;
+
+        const startBtn=card.querySelector(".startBtn");
+        if(startBtn){
+          const live=stream?.runtime?.state==="live_or_starting";
+          const keyConfigured=Boolean(stream?.keyConfigured);
+          startBtn.disabled=live||!keyConfigured||!mediaId;
+        }
+
+        toast(mediaId?"Video assigned to stream":"Video removed from stream");
+      }catch(err){
+        toast(err.message,true);
+        await loadAll();
+      }
+    });
+
     card.querySelector(".saveBtn").addEventListener("click",()=>saveStream(card,id));
+
     card.querySelector(".startBtn").addEventListener("click",async()=>{
-      try{await saveStream(card,id,true);await api("/api/streams/"+encodeURIComponent(id)+"/start",{method:"POST",body:"{}"});toast("Stream started");setTimeout(loadAll,1200)}
-      catch(e){toast(e.message,true)}
+      try{
+        await saveStream(card,id,true);
+        await api("/api/streams/"+encodeURIComponent(id)+"/start",{method:"POST",body:"{}"});
+        toast("Stream started");
+        setTimeout(loadAll,1200);
+      }catch(e){toast(e.message,true)}
     });
+
     card.querySelector(".stopBtn").addEventListener("click",async()=>{
-      try{await api("/api/streams/"+encodeURIComponent(id)+"/stop",{method:"POST",body:"{}"});toast("Stream stopped");setTimeout(loadAll,1000)}
-      catch(e){toast(e.message,true)}
+      try{
+        await api("/api/streams/"+encodeURIComponent(id)+"/stop",{method:"POST",body:"{}"});
+        toast("Stream stopped");
+        setTimeout(loadAll,1000);
+      }catch(e){toast(e.message,true)}
     });
+
     card.querySelector(".deleteBtn").addEventListener("click",async()=>{
       if(!confirm("Delete this stream card? Video in Storage will stay."))return;
-      try{await api("/api/streams/"+encodeURIComponent(id),{method:"DELETE"});await loadAll();toast("Stream deleted")}
-      catch(e){toast(e.message,true)}
+      try{
+        await api("/api/streams/"+encodeURIComponent(id),{method:"DELETE"});
+        await loadAll();
+        toast("Stream deleted");
+      }catch(e){toast(e.message,true)}
     });
   });
 }
@@ -164,6 +213,51 @@ async function pollPrepare(){
       if(p.state==="idle"){clearInterval(timer);await loadAll();toast("Preparation finished")}
     }catch(e){clearInterval(timer)}
   },3000);
+}
+
+async function refreshRuntime(){
+  try{
+    const s=await api("/api/streams");
+    const fresh=s.items||[];
+
+    for(const incoming of fresh){
+      const current=state.streams.find(x=>x.id===incoming.id);
+      if(current){
+        current.runtime=incoming.runtime;
+        current.keyConfigured=incoming.keyConfigured;
+      }
+
+      const card=document.querySelector('.stream-card[data-id="'+CSS.escape(incoming.id)+'"]');
+      if(!card) continue;
+
+      const badge=card.querySelector(".badge");
+      if(badge){
+        const st=incoming.runtime?.state||"idle";
+        badge.textContent=st==="live_or_starting"?"LIVE":st.toUpperCase();
+        badge.className="badge"+(st==="live_or_starting"?" live":"");
+      }
+
+      const status=card.querySelector(".status-line");
+      if(status){
+        const r=incoming.runtime||{};
+        status.textContent="Worker: "+(r.state||"idle")
+          +(r.metrics?.bitrate?" · "+r.metrics.bitrate:"")
+          +(r.lastError?" · "+r.lastError:"");
+      }
+
+      const live=incoming.runtime?.state==="live_or_starting";
+      const mediaId=card.querySelector(".mediaId")?.value||null;
+      const startBtn=card.querySelector(".startBtn");
+      const stopBtn=card.querySelector(".stopBtn");
+      const deleteBtn=card.querySelector(".deleteBtn");
+
+      if(startBtn) startBtn.disabled=live||!incoming.keyConfigured||!mediaId;
+      if(stopBtn) stopBtn.disabled=!live;
+      if(deleteBtn) deleteBtn.disabled=live;
+    }
+  }catch(e){
+    q("#serverStatus").textContent="Connection error";
+  }
 }
 
 async function loadAll(){
@@ -194,4 +288,4 @@ q("#fileInput").addEventListener("change",async e=>{
 
 setView("streams");
 loadAll();
-setInterval(loadAll,5000);
+setInterval(refreshRuntime,5000);

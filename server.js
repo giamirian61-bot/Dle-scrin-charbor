@@ -1312,127 +1312,129 @@ async function prepareBucketMedia(mediaId) {
     child.once("exit", (code, signal) => resolve({ code, signal }));
   });
 
-  const parts = [];
-  const PART_BYTES = 32 * 1024 * 1024;
-  let buffers = [];
-  let bufferedBytes = 0;
-  let uploadedBytes = 0;
-  let partNumber = 1;
+  void (async () => {
+    const parts = [];
+    const PART_BYTES = 32 * 1024 * 1024;
+    let buffers = [];
+    let bufferedBytes = 0;
+    let uploadedBytes = 0;
+    let partNumber = 1;
 
-  const uploadPreparedPart = async body => {
-    const result = await uploadMultipartPart({
-      key:preparedKey,
-      uploadId,
-      partNumber,
-      body
-    });
-    parts.push({ PartNumber:result.PartNumber, ETag:result.ETag });
-    uploadedBytes += body.length;
-    partNumber += 1;
+    const uploadPreparedPart = async body => {
+      const result = await uploadMultipartPart({
+        key:preparedKey,
+        uploadId,
+        partNumber,
+        body
+      });
+      parts.push({ PartNumber:result.PartNumber, ETag:result.ETag });
+      uploadedBytes += body.length;
+      partNumber += 1;
 
-    const current = await getBucketMedia(id);
-    if (current) {
+      const current = await getBucketMedia(id);
+      if (current) {
+        await upsertBucketMedia({
+          ...current,
+          status:"PREPARING",
+          prepareProgressPct:Math.round(latestPct * 10) / 10,
+          preparedUploadedBytes:uploadedBytes,
+          updatedAt:new Date().toISOString()
+        });
+      }
+    };
+
+    try {
+      for await (const chunk of child.stdout) {
+        buffers.push(chunk);
+        bufferedBytes += chunk.length;
+
+        while (bufferedBytes >= PART_BYTES) {
+          const all = Buffer.concat(buffers, bufferedBytes);
+          const body = all.subarray(0, PART_BYTES);
+          const rest = all.subarray(PART_BYTES);
+          buffers = rest.length ? [rest] : [];
+          bufferedBytes = rest.length;
+          await uploadPreparedPart(body);
+        }
+      }
+
+      if (bufferedBytes > 0) {
+        await uploadPreparedPart(Buffer.concat(buffers, bufferedBytes));
+      }
+
+      const { code, signal } = await exitPromise;
+      if (code !== 0) {
+        throw new Error(job.lastError || `ffmpeg_exit_${code ?? signal}`);
+      }
+      if (!parts.length) throw new Error("prepared_output_empty");
+
+      await completeMultipartUpload({
+        key:preparedKey,
+        uploadId,
+        parts
+      });
+
+      const head = await headBucketObject(preparedKey);
+      if (!head.size) throw new Error("prepared_bucket_object_empty");
+
+      const preparedUrl = await createBucketReadUrl(preparedKey, 21600);
+      const preparedProbe = await analyzeRemoteMedia(preparedUrl, head.size);
+      const preparedProfile = chooseProfile(preparedProbe);
+      if (!preparedProfile.streamReady) {
+        throw new Error("prepared_file_not_stream_ready");
+      }
+
+      const completed = await getBucketMedia(id) || item;
       await upsertBucketMedia({
-        ...current,
-        status:"PREPARING",
-        prepareProgressPct:Math.round(latestPct * 10) / 10,
-        preparedUploadedBytes:uploadedBytes,
+        ...completed,
+        status:"READY_DIRECT",
+        preparedKey,
+        prepareUploadId:null,
+        preparedSize:head.size,
+        preparedProbe,
+        preparedProfile,
+        preparedTargetVideoBitrate:kbps,
+        bitratePolicyVersion:BITRATE_POLICY_VERSION,
+        prepareProgressPct:100,
+        preparedUploadedBytes:head.size,
+        preparedAt:new Date().toISOString(),
+        prepareError:null,
         updatedAt:new Date().toISOString()
       });
-    }
-  };
 
-  try {
-    for await (const chunk of child.stdout) {
-      buffers.push(chunk);
-      bufferedBytes += chunk.length;
-
-      while (bufferedBytes >= PART_BYTES) {
-        const all = Buffer.concat(buffers, bufferedBytes);
-        const body = all.subarray(0, PART_BYTES);
-        const rest = all.subarray(PART_BYTES);
-        buffers = rest.length ? [rest] : [];
-        bufferedBytes = rest.length;
-        await uploadPreparedPart(body);
-      }
-    }
-
-    if (bufferedBytes > 0) {
-      await uploadPreparedPart(Buffer.concat(buffers, bufferedBytes));
-    }
-
-    const { code, signal } = await exitPromise;
-    if (code !== 0) {
-      throw new Error(job.lastError || `ffmpeg_exit_${code ?? signal}`);
-    }
-    if (!parts.length) throw new Error("prepared_output_empty");
-
-    await completeMultipartUpload({
-      key:preparedKey,
-      uploadId,
-      parts
-    });
-
-    const head = await headBucketObject(preparedKey);
-    if (!head.size) throw new Error("prepared_bucket_object_empty");
-
-    const preparedUrl = await createBucketReadUrl(preparedKey, 21600);
-    const preparedProbe = await analyzeRemoteMedia(preparedUrl, head.size);
-    const preparedProfile = chooseProfile(preparedProbe);
-    if (!preparedProfile.streamReady) {
-      throw new Error("prepared_file_not_stream_ready");
-    }
-
-    const completed = await getBucketMedia(id) || item;
-    await upsertBucketMedia({
-      ...completed,
-      status:"READY_DIRECT",
-      preparedKey,
-      prepareUploadId:null,
-      preparedSize:head.size,
-      preparedProbe,
-      preparedProfile,
-      preparedTargetVideoBitrate:kbps,
-      bitratePolicyVersion:BITRATE_POLICY_VERSION,
-      prepareProgressPct:100,
-      preparedUploadedBytes:head.size,
-      preparedAt:new Date().toISOString(),
-      prepareError:null,
-      updatedAt:new Date().toISOString()
-    });
-
-    void notifyTelegram(`✅ Stream Harbor
+      void notifyTelegram(`✅ Stream Harbor
 Видео подготовлено и готово к эфиру
 Файл: ${completed.originalName || id}
 Размер готовой версии: ${(head.size/1024/1024).toFixed(1)} MB`);
-  } catch (err) {
-    try { child.kill("SIGTERM"); } catch {}
-    await abortMultipartUpload({ key:preparedKey, uploadId }).catch(() => {});
-    await deleteBucketObject(preparedKey).catch(() => {});
+    } catch (err) {
+      try { child.kill("SIGTERM"); } catch {}
+      await abortMultipartUpload({ key:preparedKey, uploadId }).catch(() => {});
+      await deleteBucketObject(preparedKey).catch(() => {});
 
-    const message = sanitizeLog(err?.message || err);
-    const failed = await getBucketMedia(id) || item;
-    await upsertBucketMedia({
-      ...failed,
-      status:"PREPARE_FAILED",
-      prepareUploadId:null,
-      prepareError:message,
-      updatedAt:new Date().toISOString()
-    }).catch(() => {});
+      const message = sanitizeLog(err?.message || err);
+      const failed = await getBucketMedia(id) || item;
+      await upsertBucketMedia({
+        ...failed,
+        status:"PREPARE_FAILED",
+        prepareUploadId:null,
+        prepareError:message,
+        updatedAt:new Date().toISOString()
+      }).catch(() => {});
 
-    void notifyTelegram(`🚨 Stream Harbor
+      void notifyTelegram(`🚨 Stream Harbor
 Подготовка видео не удалась
 Файл: ${failed.originalName || id}
 Ошибка: ${message}`);
-  } finally {
-    if (prepareJob?.pid === child.pid) prepareJob = null;
-    setImmediate(() => runNextPrepareJob().catch(err => {
-      console.error(JSON.stringify({
-        event:"prepare_queue_runner_failed",
-        error:sanitizeLog(err?.message || err)
+    } finally {
+      if (prepareJob?.pid === child.pid) prepareJob = null;
+      setImmediate(() => runNextPrepareJob().catch(err => {
+        console.error(JSON.stringify({
+          event:"prepare_queue_runner_failed",
+          error:sanitizeLog(err?.message || err)
+        }));
       }));
-    }));
-  }
+    }
+  })();
 
   return {
     state:"preparing",

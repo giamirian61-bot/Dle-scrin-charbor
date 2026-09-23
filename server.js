@@ -855,7 +855,7 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
   const id = path.basename(req.params.id);
   const target = path.join(MEDIA_DIR, id);
 
-  if (active?.file === id) {
+  if ([...activeSlots.values()].some(s => s.file === id)) {
     return res.status(409).json({ error:"file_is_streaming" });
   }
   if (prepareJob?.mediaId === id) {
@@ -904,53 +904,81 @@ app.get("/api/prepare/status", requireOwner, (_req, res) => {
   });
 });
 
-app.post("/api/stream/start", requireOwner, async (req, res) => {
+function streamErrorStatus(msg) {
+  return msg === "stream_already_active" ? 409 :
+    msg === "slot_stream_key_not_configured" ? 503 :
+    msg === "invalid_slot" ? 400 :
+    msg === "invalid_media_id" ? 400 :
+    msg === "media_requires_preparation" ? 409 :
+    msg.includes("ENOENT") ? 404 : 422;
+}
+
+app.get("/api/slots", requireOwner, async (_req, res) => {
+  const state = await readSlotsState();
+  const preparation = prepareJob
+    ? {
+        state:prepareJob.state,
+        mediaId:prepareJob.mediaId,
+        startedAt:prepareJob.startedAt,
+        metrics:prepareJob.metrics
+      }
+    : { state:"idle" };
+
+  res.json({
+    slots:SLOT_IDS.map(id => slotStatusPayload(id, state.slots[id])),
+    preparation
+  });
+});
+
+app.get("/api/slots/:slotId/status", requireOwner, async (req, res) => {
+  const id = String(req.params.slotId);
+  if (!SLOT_IDS.includes(id)) return res.status(400).json({ error:"invalid_slot" });
+  const state = await readSlotsState();
+  res.json(slotStatusPayload(id, state.slots[id]));
+});
+
+app.post("/api/slots/:slotId/start", requireOwner, async (req, res) => {
   try {
-    const result = await startStreamInternal(req.body?.mediaId);
-    res.json({
-      ok:true,
-      state:"starting",
-      ...result
-    });
+    const result = await startStreamInternal(req.params.slotId, req.body?.mediaId);
+    res.json({ ok:true, state:"starting", ...result });
   } catch (err) {
     const msg = String(err?.message || err);
-    const status =
-      msg === "stream_already_active" ? 409 :
-      msg === "youtube_stream_key_not_configured" ? 503 :
-      msg === "invalid_media_id" ? 400 :
-      msg.includes("ENOENT") ? 404 : 422;
+    res.status(streamErrorStatus(msg)).json({ error:msg });
+  }
+});
 
-    res.status(status).json({ error:msg });
+app.post("/api/slots/:slotId/stop", requireOwner, async (req, res) => {
+  try {
+    res.json(await stopSlot(req.params.slotId));
+  } catch (err) {
+    const msg = String(err?.message || err);
+    res.status(streamErrorStatus(msg)).json({ error:msg });
+  }
+});
+
+// Backwards-compatible single-stream aliases map to slot 1.
+app.post("/api/stream/start", requireOwner, async (req, res) => {
+  try {
+    const result = await startStreamInternal("1", req.body?.mediaId);
+    res.json({ ok:true, state:"starting", ...result });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    res.status(streamErrorStatus(msg)).json({ error:msg });
   }
 });
 
 app.post("/api/stream/stop", requireOwner, async (_req, res) => {
-  res.json(await stopActiveStream());
+  res.json(await stopSlot("1"));
 });
 
 app.get("/api/stream/status", requireOwner, async (_req, res) => {
-  const desired = await readState();
-  const preparation = prepareJob ? {state:prepareJob.state,mediaId:prepareJob.mediaId,startedAt:prepareJob.startedAt} : {state:"idle"};
-
-  if (!active) {
-    return res.json({
-      state:"idle",
-      desired:desired.desired || "stopped",
-      preparation
-    });
-  }
-
+  const state = await readSlotsState();
+  const payload = slotStatusPayload("1", state.slots["1"]);
   res.json({
-    state:"live_or_starting",
-    desired:desired.desired || "running",
-    pid:active.pid,
-    mediaId:active.file,
-    startedAt:active.startedAt,
-    mode:active.mode,
-    profile:active.profile,
-    metrics:active.metrics,
-    lastError:active.lastError,
-    preparation
+    ...payload,
+    preparation:prepareJob
+      ? { state:prepareJob.state, mediaId:prepareJob.mediaId, startedAt:prepareJob.startedAt }
+      : { state:"idle" }
   });
 });
 

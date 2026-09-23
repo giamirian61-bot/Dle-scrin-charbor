@@ -20,6 +20,7 @@ await fs.mkdir(MEDIA_DIR, { recursive: true });
 
 app.use(helmet());
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: false }));
 app.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }));
 
 function safeEqual(a, b) {
@@ -133,6 +134,82 @@ app.post("/test-upload", requireOwner, upload.single("file"), async (req, res) =
     await fs.unlink(req.file.path).catch(() => {});
     res.status(422).type("html").send(`<h1>INVALID VIDEO</h1><pre>${escapeHtml(String(err.message || err))}</pre>`);
   }
+});
+
+app.get("/test-control", requireOwner, async (_req, res) => {
+  const names = await fs.readdir(MEDIA_DIR);
+  const files = [];
+  for (const name of names) {
+    const full = path.join(MEDIA_DIR, name);
+    const st = await fs.stat(full).catch(() => null);
+    if (st?.isFile()) files.push({ id: name, size: st.size });
+  }
+
+  const rows = files.map(f => `
+    <div class="file">
+      <div><b>${escapeHtml(f.id)}</b><br><small>${(f.size/1024/1024).toFixed(1)} MB</small></div>
+      <button onclick="startStream('${escapeHtml(f.id)}')">Start test stream</button>
+    </div>`).join("");
+
+  res.type("html").send(`<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stream Harbor Test Control</title>
+<style>
+body{font-family:system-ui,Arial,sans-serif;background:#0b0f14;color:#e8eef5;max-width:860px;margin:40px auto;padding:0 20px}
+.card{background:#121923;border:1px solid #263241;border-radius:16px;padding:24px;margin-bottom:18px}
+.file{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:14px 0;border-top:1px solid #263241}
+button{font:inherit;background:#7c3aed;color:white;border:0;border-radius:10px;padding:12px 18px;cursor:pointer}
+.stop{background:#b42318}.status{font-family:ui-monospace,Consolas,monospace;background:#080b10;padding:14px;border-radius:10px;white-space:pre-wrap}
+small{color:#9fb0c3}.ok{color:#6ee7a8}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Stream Harbor · Test Control</h1>
+<p>Первый RTMPS-тест. YouTube key хранится только в Railway.</p>
+<div id="files">${rows || "<p>Нет загруженных файлов.</p>"}</div>
+</div>
+<div class="card">
+<h2>Статус</h2>
+<div id="status" class="status">Проверяю...</div>
+<p><button class="stop" onclick="stopStream()">Stop stream</button></p>
+</div>
+<script>
+async function api(url, options={}){
+  const r=await fetch(url,{credentials:"same-origin",headers:{"Content-Type":"application/json",...(options.headers||{})},...options});
+  const text=await r.text();
+  let data; try{data=JSON.parse(text)}catch{data={raw:text}}
+  if(!r.ok) throw new Error(JSON.stringify(data));
+  return data;
+}
+async function status(){
+  try{
+    const d=await api("/api/stream/status");
+    document.getElementById("status").textContent=JSON.stringify(d,null,2);
+  }catch(e){document.getElementById("status").textContent=String(e)}
+}
+async function startStream(id){
+  if(!confirm("Запустить этот файл в YouTube по RTMPS?")) return;
+  try{
+    const d=await api("/api/stream/start",{method:"POST",body:JSON.stringify({mediaId:id})});
+    document.getElementById("status").textContent=JSON.stringify(d,null,2);
+    setTimeout(status,1500);
+  }catch(e){alert(e.message);status();}
+}
+async function stopStream(){
+  if(!confirm("Остановить тестовый поток?")) return;
+  try{
+    const d=await api("/api/stream/stop",{method:"POST",body:"{}"});
+    document.getElementById("status").textContent=JSON.stringify(d,null,2);
+    setTimeout(status,1500);
+  }catch(e){alert(e.message);status();}
+}
+status(); setInterval(status,5000);
+</script>
+</body></html>`);
 });
 
 app.get("/health", (_req, res) => res.json({

@@ -352,10 +352,7 @@ function buildFfmpegArgs(filePath, profile, target) {
   ];
 }
 
-async function startStreamInternal(mediaId, { restore=false, retryCount=0 } = {}) {
-  if (active) throw new Error("stream_already_active");
-  if (!YOUTUBE_STREAM_KEY) throw new Error("youtube_stream_key_not_configured");
-
+async function resolveStreamSource(mediaId) {
   const id = path.basename(String(mediaId || ""));
   if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
 
@@ -384,12 +381,12 @@ async function startStreamInternal(mediaId, { restore=false, retryCount=0 } = {}
   let profile = meta.profile;
 
   if (meta.preparedId) {
-    const preparedPath = path.join(MEDIA_DIR, meta.preparedId);
+    const preparedPath = path.join(MEDIA_DIR, path.basename(meta.preparedId));
     try {
       await fs.access(preparedPath);
       streamPath = preparedPath;
       streamProbe = meta.preparedProbe || await analyzeFile(preparedPath);
-      profile = chooseProfile(streamProbe);
+      profile = meta.preparedProfile || chooseProfile(streamProbe);
     } catch {}
   }
 
@@ -397,121 +394,188 @@ async function startStreamInternal(mediaId, { restore=false, retryCount=0 } = {}
     throw new Error("media_requires_preparation");
   }
 
-  const target = `${YOUTUBE_RTMPS_BASE}/${YOUTUBE_STREAM_KEY}`;
-  const args = buildFfmpegArgs(streamPath, profile, target);
+  return { id, streamPath, streamProbe, profile };
+}
 
-  const child = spawn("ffmpeg", args, {
-    stdio: ["ignore","ignore","pipe"],
-    shell: false
+function slotStatusPayload(slotId, desiredState=null) {
+  const id = String(slotId);
+  const active = activeSlots.get(id);
+  const desired = desiredState || null;
+
+  if (!active) {
+    return {
+      slotId:id,
+      state:"idle",
+      desired:desired?.desired || "stopped",
+      mediaId:desired?.mediaId || null,
+      keyConfigured:Boolean(streamKeyForSlot(id))
+    };
+  }
+
+  return {
+    slotId:id,
+    state:"live_or_starting",
+    desired:desired?.desired || "running",
+    keyConfigured:Boolean(streamKeyForSlot(id)),
+    pid:active.pid,
+    mediaId:active.file,
+    startedAt:active.startedAt,
+    mode:active.mode,
+    profile:active.profile,
+    metrics:active.metrics,
+    lastError:active.lastError
+  };
+}
+
+async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=0 } = {}) {
+  const id = String(slotId);
+  if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
+  if (activeSlots.has(id)) throw new Error("stream_already_active");
+
+  const streamKey = streamKeyForSlot(id);
+  if (!streamKey) throw new Error("slot_stream_key_not_configured");
+
+  const source = await resolveStreamSource(mediaId);
+  const target = `${YOUTUBE_RTMPS_BASE}/${streamKey}`;
+
+  const worker = fork("./worker.js", [], {
+    env:{
+      PATH:process.env.PATH || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      WORKER_MEDIA_PATH:source.streamPath,
+      YOUTUBE_STREAM_TARGET:target,
+      WORKER_SLOT_ID:id
+    },
+    stdio:["ignore","ignore","ignore","ipc"]
   });
 
-  const metrics = {
-    fps:null,
-    bitrate:null,
-    outTime:null,
-    speed:null,
-    progress:null
-  };
-
-  active = {
-    pid:child.pid,
-    file:id,
+  const active = {
+    pid:worker.pid,
+    file:source.id,
     startedAt:new Date().toISOString(),
-    child,
-    mode:profile.mode,
-    profile,
-    probe:streamProbe,
-    metrics,
+    worker,
+    mode:"copy",
+    profile:source.profile,
+    probe:source.streamProbe,
+    metrics:{
+      fps:null,
+      bitrate:null,
+      outTime:null,
+      speed:null,
+      progress:null
+    },
     lastError:null,
     intentionalStop:false,
     retryCount
   };
+  activeSlots.set(id, active);
 
-  let stderrBuffer = "";
-  child.stderr.on("data", chunk => {
-    stderrBuffer += chunk.toString("utf8");
-    const lines = stderrBuffer.split(/\r?\n/);
-    stderrBuffer = lines.pop() || "";
+  worker.on("message", msg => {
+    const current = activeSlots.get(id);
+    if (!current || current.pid !== worker.pid || !msg) return;
 
-    for (const raw of lines) {
-      const line = sanitizeLog(raw.trim());
-      if (!line) continue;
-
-      const eq = line.indexOf("=");
-      if (eq > 0) {
-        const key = line.slice(0, eq);
-        const value = line.slice(eq + 1);
-        if (key === "fps") metrics.fps = value;
-        else if (key === "bitrate") metrics.bitrate = value;
-        else if (key === "out_time") metrics.outTime = value;
-        else if (key === "speed") metrics.speed = value;
-        else if (key === "progress") metrics.progress = value;
-      } else {
-        active && (active.lastError = line.slice(-500));
-      }
+    if (msg.type === "metrics" && msg.metrics) {
+      current.metrics = { ...current.metrics, ...msg.metrics };
+    } else if (msg.type === "ffmpeg_error" || msg.type === "fatal") {
+      current.lastError = sanitizeLog(msg.error || "worker_error");
     }
   });
 
-  child.on("exit", async (code, signal) => {
-    const snapshot = active;
-    if (active?.pid === child.pid) active = null;
+  worker.on("exit", async (code, signal) => {
+    const snapshot = activeSlots.get(id);
+    if (snapshot?.pid === worker.pid) activeSlots.delete(id);
 
     console.log(JSON.stringify({
-      event:"ffmpeg_exit",
+      event:"worker_exit",
+      slotId:id,
       code,
       signal,
-      mediaId:id,
-      mode:profile.mode,
+      mediaId:source.id,
       intentional:Boolean(snapshot?.intentionalStop)
     }));
 
     if (snapshot?.intentionalStop) return;
 
-    const state = await readState();
+    const state = await readSlotsState();
+    const desired = state.slots[id] || { desired:"stopped" };
     const shouldRestart =
-      state.desired === "running" &&
-      state.mediaId === id &&
+      desired.desired === "running" &&
+      desired.mediaId === source.id &&
       retryCount < 3;
 
     if (shouldRestart) {
-      clearTimeout(restartTimer);
-      restartTimer = setTimeout(async () => {
+      const oldTimer = restartTimers.get(id);
+      if (oldTimer) clearTimeout(oldTimer);
+
+      const timer = setTimeout(async () => {
+        restartTimers.delete(id);
         try {
-          await startStreamInternal(id, {
+          await startStreamInternal(id, source.id, {
             restore:true,
             retryCount:retryCount + 1
           });
         } catch (err) {
           console.error(JSON.stringify({
-            event:"auto_restart_failed",
+            event:"worker_auto_restart_failed",
+            slotId:id,
             attempt:retryCount + 1,
             error:sanitizeLog(err?.message || err)
           }));
         }
       }, 10_000);
+
+      restartTimers.set(id, timer);
     }
   });
 
   if (!restore) {
-    await writeState({
+    await updateSlotState(id, {
       desired:"running",
-      mediaId:id,
+      mediaId:source.id,
       requestedAt:new Date().toISOString()
     });
   }
 
   return {
-    pid:child.pid,
-    mediaId:id,
-    mode:profile.mode,
-    profile,
-    probe:streamProbe
+    slotId:id,
+    pid:worker.pid,
+    mediaId:source.id,
+    mode:"copy",
+    profile:source.profile,
+    probe:source.streamProbe
   };
 }
 
+async function stopSlot(slotId) {
+  const id = String(slotId);
+  if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
+
+  const timer = restartTimers.get(id);
+  if (timer) clearTimeout(timer);
+  restartTimers.delete(id);
+
+  await updateSlotState(id, {
+    desired:"stopped",
+    stoppedAt:new Date().toISOString()
+  });
+
+  const active = activeSlots.get(id);
+  if (!active) return { ok:true, slotId:id, state:"idle" };
+
+  active.intentionalStop = true;
+  activeSlots.delete(id);
+
+  try { active.worker.kill("SIGTERM"); } catch {}
+  setTimeout(() => {
+    try { active.worker.kill("SIGKILL"); } catch {}
+  }, 8000).unref();
+
+  return { ok:true, slotId:id, state:"stopping", pid:active.pid };
+}
+
+
 async function prepareMedia(mediaId) {
   if (prepareJob) throw new Error("prepare_job_already_active");
-  if (active) throw new Error("cannot_prepare_while_streaming");
+  if (activeSlots.size > 0) throw new Error("cannot_prepare_while_streaming");
 
   const id = path.basename(String(mediaId || ""));
   if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
@@ -681,37 +745,14 @@ async function prepareMedia(mediaId) {
     pid:child.pid
   };
 }
-async function stopActiveStream() {
-  clearTimeout(restartTimer);
-  restartTimer = null;
-
-  await writeState({
-    desired:"stopped",
-    stoppedAt:new Date().toISOString()
-  });
-
-  if (!active) return { ok:true, state:"idle" };
-
-  const child = active.child;
-  const pid = active.pid;
-  active.intentionalStop = true;
-  active = null;
-
-  child.kill("SIGTERM");
-  setTimeout(() => {
-    try { child.kill("SIGKILL"); } catch {}
-  }, 8000).unref();
-
-  return { ok:true, state:"stopping", pid };
-}
-
 async function listMedia() {
   const names = await fs.readdir(MEDIA_DIR);
   const items = [];
 
   for (const name of names) {
     if (
-      name === path.basename(STATE_FILE) ||
+      name === path.basename(LEGACY_STATE_FILE) ||
+      name === path.basename(SLOT_STATE_FILE) ||
       name.endsWith(".meta.json") ||
       name.endsWith(".ready.mp4") ||
       name.startsWith(".")
@@ -769,7 +810,7 @@ async function listMedia() {
 app.get("/health", (_req, res) => res.json({
   ok:true,
   ffmpeg:true,
-  streaming:Boolean(active),
+  streamingSlots:activeSlots.size,
   youtubeKeyConfigured:Boolean(YOUTUBE_STREAM_KEY),
   persistentState:true,
   preparing:Boolean(prepareJob)

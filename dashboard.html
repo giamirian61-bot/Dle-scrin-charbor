@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Stream Harbor</title>
+  <link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">SH</div>
+        <div>
+          <div class="brand-title">Stream Harbor</div>
+          <div class="brand-sub">Control Center</div>
+        </div>
+      </div>
+      <nav>
+        <button class="nav-item active" data-view="streams"><span>▦</span> My streams</button>
+        <button class="nav-item" data-view="storage"><span>▰</span> Storage</button>
+      </nav>
+      <div class="sidebar-footer">
+        <a href="/test-control">Emergency control</a>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">STREAM HARBOR</div>
+          <h1 id="pageTitle">My streams</h1>
+        </div>
+        <div class="top-status">
+          <span class="dot"></span>
+          <span id="serverStatus">Server online</span>
+        </div>
+      </header>
+
+      <section id="streamsView" class="view">
+        <div class="toolbar">
+          <button id="addStreamBtn" class="btn primary">＋ Add Stream</button>
+          <div class="hint"><span id="streamCount">0</span> streams</div>
+        </div>
+        <div id="streamsGrid" class="streams-grid"></div>
+      </section>
+
+      <section id="storageView" class="view hidden">
+        <div class="toolbar">
+          <label class="btn primary upload-label">
+            ↑ Upload files
+            <input id="fileInput" type="file" accept="video/mp4,video/quicktime,video/webm" hidden>
+          </label>
+          <div id="uploadState" class="hint">All uploaded videos live here and can be assigned to any stream.</div>
+        </div>
+        <div id="storageGrid" class="storage-grid"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/dashboard.js" defer></script>
+</body>
+</html>

@@ -319,15 +319,16 @@ async function startStreamInternal(mediaId, { restore=false, retryCount=0 } = {}
   let meta = await readMeta(id);
   if (!meta?.probe || !meta?.profile) {
     const analysis = await analyzeFile(sourcePath);
+    const initialProfile = chooseProfile(analysis);
     meta = {
       ...(meta || {}),
       id,
       originalName:meta?.originalName || id,
       size:(await fs.stat(sourcePath)).size,
-      status:profile.streamReady ? "READY_DIRECT" : "PREPARE_NEEDED",
+      status:initialProfile.streamReady ? "READY_DIRECT" : "PREPARE_NEEDED",
       createdAt:meta?.createdAt || new Date().toISOString(),
       probe:analysis,
-      profile:chooseProfile(analysis)
+      profile:initialProfile
     };
     await writeMeta(id, meta);
   }
@@ -458,7 +459,7 @@ async function startStreamInternal(mediaId, { restore=false, retryCount=0 } = {}
     mediaId:id,
     mode:profile.mode,
     profile,
-    probe:summary
+    probe:streamProbe
   };
 }
 
@@ -489,7 +490,8 @@ async function prepareMedia(mediaId) {
       probe:sourceAnalysis,
       profile:sourceProfile,
       preparedId:null,
-      preparedProbe:null
+      preparedProbe:null,
+      preparedProfile:null
     };
     await writeMeta(id, meta);
     return {
@@ -522,6 +524,9 @@ async function prepareMedia(mediaId) {
     "-b:a","128k",
     "-ar","48000",
     "-movflags","+faststart",
+    "-progress","pipe:2",
+    "-nostats",
+    "-loglevel","error",
     preparedPath
   ];
 
@@ -537,53 +542,99 @@ async function prepareMedia(mediaId) {
     startedAt:new Date().toISOString(),
     state:"preparing",
     lastError:null,
+    metrics:{ fps:null, outTime:null, speed:null, progress:null },
     child
   };
   prepareJob = job;
 
-  child.stderr.on("data", chunk => {
-    const line = sanitizeLog(chunk.toString("utf8"));
-    if (line.trim()) job.lastError = line.slice(-800);
-  });
-
-  const exit = await new Promise(resolve => {
-    child.on("exit", (code, signal) => resolve({ code, signal }));
-  });
-
-  if (prepareJob?.pid === child.pid) prepareJob = null;
-
-  if (exit.code !== 0) {
-    await fs.unlink(preparedPath).catch(() => {});
-    throw new Error("prepare_failed");
-  }
-
-  const preparedProbe = await analyzeFile(preparedPath);
-  const preparedProfile = chooseProfile(preparedProbe);
-  if (!preparedProfile.streamReady) {
-    await fs.unlink(preparedPath).catch(() => {});
-    throw new Error("prepared_file_not_stream_ready");
-  }
-
   meta = {
     ...meta,
-    status:"READY_DIRECT",
+    status:"PREPARING",
     probe:sourceAnalysis,
-    profile:sourceProfile,
-    preparedId,
-    preparedProbe,
-    preparedProfile,
-    preparedAt:new Date().toISOString()
+    profile:sourceProfile
   };
   await writeMeta(id, meta);
 
+  let buffer = "";
+  child.stderr.on("data", chunk => {
+    buffer += chunk.toString("utf8");
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+
+    for (const raw of lines) {
+      const line = sanitizeLog(raw.trim());
+      if (!line) continue;
+      const eq = line.indexOf("=");
+      if (eq > 0) {
+        const key = line.slice(0, eq);
+        const value = line.slice(eq + 1);
+        if (key === "fps") job.metrics.fps = value;
+        else if (key === "out_time") job.metrics.outTime = value;
+        else if (key === "speed") job.metrics.speed = value;
+        else if (key === "progress") job.metrics.progress = value;
+      } else {
+        job.lastError = line.slice(-800);
+      }
+    }
+  });
+
+  child.on("exit", async (exitCode, signal) => {
+    try {
+      if (exitCode !== 0) {
+        await fs.unlink(preparedPath).catch(() => {});
+        const failedMeta = await readMeta(id) || meta;
+        await writeMeta(id, {
+          ...failedMeta,
+          status:"PREPARE_FAILED",
+          prepareError:job.lastError || `ffmpeg_exit_${exitCode ?? signal}`
+        });
+        return;
+      }
+
+      const preparedProbe = await analyzeFile(preparedPath);
+      const preparedProfile = chooseProfile(preparedProbe);
+      if (!preparedProfile.streamReady) {
+        await fs.unlink(preparedPath).catch(() => {});
+        const failedMeta = await readMeta(id) || meta;
+        await writeMeta(id, {
+          ...failedMeta,
+          status:"PREPARE_FAILED",
+          prepareError:"prepared_file_not_stream_ready"
+        });
+        return;
+      }
+
+      const preparedStat = await fs.stat(preparedPath);
+      const completedMeta = await readMeta(id) || meta;
+      await writeMeta(id, {
+        ...completedMeta,
+        status:"READY_DIRECT",
+        preparedId,
+        preparedSize:preparedStat.size,
+        preparedProbe,
+        preparedProfile,
+        preparedAt:new Date().toISOString(),
+        prepareError:null
+      });
+    } catch (err) {
+      const failedMeta = await readMeta(id) || meta;
+      await writeMeta(id, {
+        ...failedMeta,
+        status:"PREPARE_FAILED",
+        prepareError:sanitizeLog(err?.message || err)
+      }).catch(() => {});
+    } finally {
+      if (prepareJob?.pid === child.pid) prepareJob = null;
+    }
+  });
+
   return {
-    state:"ready_direct",
+    state:"preparing",
     mediaId:id,
     preparedId,
-    preparedProfile
+    pid:child.pid
   };
 }
-
 async function stopActiveStream() {
   clearTimeout(restartTimer);
   restartTimer = null;
@@ -660,6 +711,8 @@ async function listMedia() {
       preparedId:meta?.preparedId || null,
       preparedProbe:meta?.preparedProbe || null,
       preparedProfile:meta?.preparedProfile || null,
+      preparedSize:meta?.preparedSize || null,
+      prepareError:meta?.prepareError || null,
       createdAt:meta?.createdAt || null
     });
   }
@@ -718,10 +771,18 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
   if (active?.file === id) {
     return res.status(409).json({ error:"file_is_streaming" });
   }
+  if (prepareJob?.mediaId === id) {
+    return res.status(409).json({ error:"file_is_preparing" });
+  }
+
+  const meta = await readMeta(id);
 
   await fs.unlink(target).catch(err => {
     if (err.code !== "ENOENT") throw err;
   });
+  if (meta?.preparedId) {
+    await fs.unlink(path.join(MEDIA_DIR, path.basename(meta.preparedId))).catch(() => {});
+  }
   await fs.unlink(path.join(MEDIA_DIR, id + ".meta.json")).catch(() => {});
 
   res.json({ ok:true });
@@ -751,6 +812,7 @@ app.get("/api/prepare/status", requireOwner, (_req, res) => {
     preparedId:prepareJob.preparedId,
     pid:prepareJob.pid,
     startedAt:prepareJob.startedAt,
+    metrics:prepareJob.metrics,
     lastError:prepareJob.lastError
   });
 });
@@ -904,6 +966,8 @@ async function refreshStatus(){
   try{
     const d=await api("/api/stream/status");
     document.getElementById("status").textContent=JSON.stringify(d,null,2);
+    const stop=document.getElementById("stopBtn");
+    if(stop) stop.disabled=d.state==="idle";
   }catch(e){
     document.getElementById("status").textContent=String(e);
   }
@@ -932,7 +996,19 @@ async function prepareMediaUi(id){
       body:"{}"
     });
     statusEl.textContent=JSON.stringify(d,null,2);
-    setTimeout(()=>location.reload(),1200);
+    const timer=setInterval(async()=>{
+      try{
+        const s=await api("/api/prepare/status");
+        statusEl.textContent=JSON.stringify({stream:await api("/api/stream/status"),preparation:s},null,2);
+        if(s.state==="idle"){
+          clearInterval(timer);
+          location.reload();
+        }
+      }catch(e){
+        clearInterval(timer);
+        statusEl.textContent=String(e);
+      }
+    },3000);
   }catch(e){
     alert(e.message);
     refreshStatus();
@@ -966,24 +1042,33 @@ app.get("/test-control", requireOwner, async (_req, res) => {
 
   const rows = files.map(f => {
     const ready = f.status === "READY_DIRECT";
-    const sourceProfile = f.profile || {};
-    const gap = f.probe?.keyframes?.maxKeyframeGap;
+    const effectiveProfile = f.preparedProfile || f.profile || {};
+    const effectiveProbe = f.preparedProbe || f.probe || {};
+    const gap = effectiveProbe?.keyframes?.maxKeyframeGap;
+    const size = f.preparedSize || f.size;
     const info = [
       f.status,
-      sourceProfile.reason || "",
+      effectiveProfile.reason || "",
       Number.isFinite(gap) ? `GOP max ${gap.toFixed(2)}s` : "",
-      `${(f.size/1024/1024).toFixed(1)} MB`
+      effectiveProbe?.video?.codec ? `${effectiveProbe.video.codec.toUpperCase()} ${effectiveProbe.video.width}x${effectiveProbe.video.height}` : "",
+      `${(size/1024/1024).toFixed(1)} MB`
     ].filter(Boolean).join(" · ");
 
-    const action = ready
-      ? `<button class="startBtn" data-media-id="${escapeHtml(f.id)}">Start stream</button>`
-      : `<button class="prepareBtn" data-media-id="${escapeHtml(f.id)}">Prepare once</button>`;
+    let action;
+    if (f.status === "PREPARING") {
+      action = `<button disabled>Preparing…</button>`;
+    } else if (ready) {
+      action = `<button class="startBtn" data-media-id="${escapeHtml(f.id)}">Start stream</button>`;
+    } else {
+      action = `<button class="prepareBtn" data-media-id="${escapeHtml(f.id)}">Prepare once</button>`;
+    }
 
     return `
       <div class="file">
         <div>
           <b>${escapeHtml(f.originalName || f.id)}</b><br>
           <small>${escapeHtml(info)}</small>
+          ${f.prepareError ? `<br><small>Ошибка подготовки: ${escapeHtml(f.prepareError)}</small>` : ""}
         </div>
         ${action}
       </div>`;
@@ -999,7 +1084,7 @@ app.get("/test-control", requireOwner, async (_req, res) => {
 body{font-family:system-ui,Arial,sans-serif;background:#0b0f14;color:#e8eef5;max-width:860px;margin:40px auto;padding:0 20px}
 .card{background:#121923;border:1px solid #263241;border-radius:16px;padding:24px;margin-bottom:18px}
 .file{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:14px 0;border-top:1px solid #263241}
-button{font:inherit;background:#7c3aed;color:white;border:0;border-radius:10px;padding:12px 18px;cursor:pointer}
+button{font:inherit;background:#7c3aed;color:white;border:0;border-radius:10px;padding:12px 18px;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}
 .stop{background:#b42318}.status{font-family:ui-monospace,Consolas,monospace;background:#080b10;padding:14px;border-radius:10px;white-space:pre-wrap}
 small{color:#9fb0c3}a{color:#a78bfa}
 </style>

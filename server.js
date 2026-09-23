@@ -137,48 +137,8 @@ app.post("/test-upload", requireOwner, upload.single("file"), async (req, res) =
   }
 });
 
-app.get("/test-control", requireOwner, async (_req, res) => {
-  const names = await fs.readdir(MEDIA_DIR);
-  const files = [];
-  for (const name of names) {
-    const full = path.join(MEDIA_DIR, name);
-    const st = await fs.stat(full).catch(() => null);
-    if (st?.isFile()) files.push({ id: name, size: st.size });
-  }
-
-  const rows = files.map(f => `
-    <div class="file">
-      <div><b>${escapeHtml(f.id)}</b><br><small>${(f.size/1024/1024).toFixed(1)} MB</small></div>
-      <button onclick="startStream('${escapeHtml(f.id)}')">Start test stream</button>
-    </div>`).join("");
-
-  res.type("html").send(`<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Stream Harbor Test Control</title>
-<style>
-body{font-family:system-ui,Arial,sans-serif;background:#0b0f14;color:#e8eef5;max-width:860px;margin:40px auto;padding:0 20px}
-.card{background:#121923;border:1px solid #263241;border-radius:16px;padding:24px;margin-bottom:18px}
-.file{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:14px 0;border-top:1px solid #263241}
-button{font:inherit;background:#7c3aed;color:white;border:0;border-radius:10px;padding:12px 18px;cursor:pointer}
-.stop{background:#b42318}.status{font-family:ui-monospace,Consolas,monospace;background:#080b10;padding:14px;border-radius:10px;white-space:pre-wrap}
-small{color:#9fb0c3}.ok{color:#6ee7a8}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>Stream Harbor · Test Control</h1>
-<p>Первый RTMPS-тест. YouTube key хранится только в Railway.</p>
-<div id="files">${rows || "<p>Нет загруженных файлов.</p>"}</div>
-</div>
-<div class="card">
-<h2>Статус</h2>
-<div id="status" class="status">Проверяю...</div>
-<p><button class="stop" onclick="stopStream()">Stop stream</button></p>
-</div>
-<script>
+app.get("/test-control.js", requireOwner, (_req, res) => {
+  res.type("application/javascript").send(`
 async function api(url, options={}){
   const r=await fetch(url,{credentials:"same-origin",headers:{"Content-Type":"application/json",...(options.headers||{})},...options});
   const text=await r.text();
@@ -208,8 +168,57 @@ async function stopStream(){
     setTimeout(status,1500);
   }catch(e){alert(e.message);status();}
 }
-status(); setInterval(status,5000);
-</script>
+document.querySelectorAll(".startBtn").forEach(btn => {
+  btn.addEventListener("click", () => startStream(btn.dataset.mediaId));
+});
+document.getElementById("stopBtn")?.addEventListener("click", stopStream);
+status();
+setInterval(status,5000);
+`);
+});
+
+app.get("/test-control", requireOwner, async (_req, res) => {
+  const names = await fs.readdir(MEDIA_DIR);
+  const files = [];
+  for (const name of names) {
+    const full = path.join(MEDIA_DIR, name);
+    const st = await fs.stat(full).catch(() => null);
+    if (st?.isFile()) files.push({ id: name, size: st.size });
+  }
+
+  const rows = files.map(f => `
+    <div class="file">
+      <div><b>${escapeHtml(f.id)}</b><br><small>${(f.size/1024/1024).toFixed(1)} MB</small></div>
+      <button class="startBtn" data-media-id="${escapeHtml(f.id)}">Start test stream</button>
+    </div>`).join("");
+
+  res.type("html").send(`<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stream Harbor Test Control</title>
+<style>
+body{font-family:system-ui,Arial,sans-serif;background:#0b0f14;color:#e8eef5;max-width:860px;margin:40px auto;padding:0 20px}
+.card{background:#121923;border:1px solid #263241;border-radius:16px;padding:24px;margin-bottom:18px}
+.file{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:14px 0;border-top:1px solid #263241}
+button{font:inherit;background:#7c3aed;color:white;border:0;border-radius:10px;padding:12px 18px;cursor:pointer}
+.stop{background:#b42318}.status{font-family:ui-monospace,Consolas,monospace;background:#080b10;padding:14px;border-radius:10px;white-space:pre-wrap}
+small{color:#9fb0c3}.ok{color:#6ee7a8}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Stream Harbor · Test Control</h1>
+<p>Первый RTMPS-тест. YouTube key хранится только в Railway.</p>
+<div id="files">${rows || "<p>Нет загруженных файлов.</p>"}</div>
+</div>
+<div class="card">
+<h2>Статус</h2>
+<div id="status" class="status">Проверяю...</div>
+<p><button class="stop" id="stopBtn">Stop stream</button></p>
+</div>
+<script src="/test-control.js" defer></script>
 </body></html>`);
 });
 

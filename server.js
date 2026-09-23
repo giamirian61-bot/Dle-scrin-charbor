@@ -1222,6 +1222,8 @@ async function prepareBucketMedia(mediaId) {
     "-map","0:a:0?",
     "-c:v","libx264",
     "-preset","veryfast",
+    "-threads","1",
+    "-x264-params","threads=1:lookahead_threads=1:sync-lookahead=0:rc-lookahead=0",
     "-pix_fmt","yuv420p",
     "-r","30",
     "-g","60",

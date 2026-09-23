@@ -117,7 +117,7 @@ function storageCard(m){
   else if(uploading) action='<button class="btn secondary" disabled>Uploading '+progressPct+'%</button>';
   else if(stalled) action='<button class="btn danger" disabled>UPLOAD STALLED</button>';
   else if(analyzing) action='<button class="btn secondary" disabled>Checking…</button>';
-  else if(bucket) action='<button class="btn secondary" disabled>Needs re-export</button>';
+  else if(bucket) action='<button class="btn primary prepareBtn">Prepare for stream</button>';
   else action='<button class="btn primary prepareBtn">'+(optimize?'Optimize bitrate':'Prepare')+'</button>';
 
   return `<article class="storage-card" data-id="${esc(m.id)}">
@@ -131,6 +131,7 @@ function storageCard(m){
       <div>Size: ${fmtMb(m.preparedSize||m.size)}</div>
       ${source?'<div>Source video bitrate: '+esc(source)+' Kbps</div>':""}
       ${target?'<div><strong>Auto target: '+esc(target)+' Kbps</strong></div>':""}
+      ${preparing?'<div class="upload-progress-label">Preparing '+Math.round(Number(m.prepareProgressPct||0))+'%</div><div class="upload-progress"><span style="width:'+Math.max(0,Math.min(100,Number(m.prepareProgressPct||0)))+'%"></span></div>':""}
     </div>
     <div class="storage-actions">
       ${action}

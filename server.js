@@ -487,6 +487,8 @@ async function writeMeta(id, meta) {
 const activeSlots = new Map();
 const restartTimers = new Map();
 let prepareJob = null;
+const prepareQueue = [];
+const queuedPrepareIds = new Set();
 
 function buildFfmpegArgs(filePath, profile, target) {
   const common = [
@@ -768,7 +770,6 @@ async function stopSlot(slotId) {
 
 
 async function prepareMedia(mediaId) {
-  if (prepareJob) throw new Error("prepare_job_already_active");
   if (activeSlots.size > 0) throw new Error("cannot_prepare_while_streaming");
 
   const id = path.basename(String(mediaId || ""));
@@ -936,6 +937,12 @@ async function prepareMedia(mediaId) {
       }).catch(() => {});
     } finally {
       if (prepareJob?.pid === child.pid) prepareJob = null;
+      setImmediate(() => runNextPrepareJob().catch(err => {
+        console.error(JSON.stringify({
+          event:"prepare_queue_runner_failed",
+          error:sanitizeLog(err?.message || err)
+        }));
+      }));
     }
   });
 
@@ -946,6 +953,75 @@ async function prepareMedia(mediaId) {
     pid:child.pid
   };
 }
+async function enqueuePrepare(mediaId) {
+  if (activeSlots.size > 0) throw new Error("cannot_prepare_while_streaming");
+
+  const id = path.basename(String(mediaId || ""));
+  if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
+
+  const sourcePath = path.join(MEDIA_DIR, id);
+  await fs.access(sourcePath);
+
+  if (prepareJob?.mediaId === id) {
+    return { state:"preparing", mediaId:id, position:0 };
+  }
+
+  const existingIndex = prepareQueue.findIndex(item => item.mediaId === id);
+  if (existingIndex >= 0) {
+    return { state:"queued", mediaId:id, position:existingIndex + 1 };
+  }
+
+  if (!prepareJob) {
+    return await prepareMedia(id);
+  }
+
+  const meta = await readMeta(id) || {
+    id,
+    originalName:id,
+    size:(await fs.stat(sourcePath)).size,
+    createdAt:new Date().toISOString()
+  };
+
+  await writeMeta(id, {
+    ...meta,
+    status:"PREPARE_QUEUED",
+    queuedAt:new Date().toISOString(),
+    prepareError:null
+  });
+
+  prepareQueue.push({ mediaId:id, queuedAt:new Date().toISOString() });
+  queuedPrepareIds.add(id);
+
+  return {
+    state:"queued",
+    mediaId:id,
+    position:prepareQueue.length
+  };
+}
+
+async function runNextPrepareJob() {
+  if (prepareJob || activeSlots.size > 0) return;
+  const next = prepareQueue.shift();
+  if (!next) return;
+
+  queuedPrepareIds.delete(next.mediaId);
+
+  try {
+    await prepareMedia(next.mediaId);
+  } catch (err) {
+    const meta = await readMeta(next.mediaId).catch(() => null);
+    if (meta) {
+      await writeMeta(next.mediaId, {
+        ...meta,
+        status:"PREPARE_FAILED",
+        prepareError:sanitizeLog(err?.message || err)
+      }).catch(() => {});
+    }
+
+    setImmediate(() => runNextPrepareJob().catch(() => {}));
+  }
+}
+
 async function listMedia() {
   const names = await fs.readdir(MEDIA_DIR);
   const items = [];
@@ -1002,9 +1078,14 @@ async function listMedia() {
       id:name,
       size:st.size,
       originalName:meta?.originalName || name,
-      status:meta?.preparedId
-        ? (Number(meta?.bitratePolicyVersion || 0) < BITRATE_POLICY_VERSION ? "OPTIMIZE_NEEDED" : "READY_DIRECT")
-        : (meta?.profile?.streamReady ? "READY_DIRECT" : meta?.status || "PREPARE_NEEDED"),
+      status:
+        prepareJob?.mediaId === name ? "PREPARING" :
+        queuedPrepareIds.has(name) ? "PREPARE_QUEUED" :
+        meta?.preparedId
+          ? (Number(meta?.bitratePolicyVersion || 0) < BITRATE_POLICY_VERSION ? "OPTIMIZE_NEEDED" : "READY_DIRECT")
+          : (meta?.profile?.streamReady
+              ? "READY_DIRECT"
+              : (["PREPARING","PREPARE_QUEUED"].includes(meta?.status) ? "PREPARE_NEEDED" : meta?.status || "PREPARE_NEEDED")),
       probe:meta?.probe || null,
       profile:meta?.profile || null,
       preparedId:meta?.preparedId || null,
@@ -1095,12 +1176,11 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
 
 app.post("/api/media/:id/prepare", requireOwner, async (req, res) => {
   try {
-    const result = await prepareMedia(req.params.id);
+    const result = await enqueuePrepare(req.params.id);
     res.json({ ok:true, ...result });
   } catch (err) {
     const msg = String(err?.message || err);
     const status =
-      msg === "prepare_job_already_active" ? 409 :
       msg === "cannot_prepare_while_streaming" ? 409 :
       msg === "invalid_media_id" ? 400 :
       msg === "media_requires_preparation" ? 409 :
@@ -1111,15 +1191,22 @@ app.post("/api/media/:id/prepare", requireOwner, async (req, res) => {
 });
 
 app.get("/api/prepare/status", requireOwner, (_req, res) => {
-  if (!prepareJob) return res.json({ state:"idle" });
   res.json({
-    state:prepareJob.state,
-    mediaId:prepareJob.mediaId,
-    preparedId:prepareJob.preparedId,
-    pid:prepareJob.pid,
-    startedAt:prepareJob.startedAt,
-    metrics:prepareJob.metrics,
-    lastError:prepareJob.lastError
+    state:prepareJob ? prepareJob.state : "idle",
+    current:prepareJob ? {
+      state:prepareJob.state,
+      mediaId:prepareJob.mediaId,
+      preparedId:prepareJob.preparedId,
+      pid:prepareJob.pid,
+      startedAt:prepareJob.startedAt,
+      metrics:prepareJob.metrics,
+      lastError:prepareJob.lastError
+    } : null,
+    queue:prepareQueue.map((item,index) => ({
+      mediaId:item.mediaId,
+      position:index + 1,
+      queuedAt:item.queuedAt
+    }))
   });
 });
 

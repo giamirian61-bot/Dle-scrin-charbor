@@ -16,6 +16,7 @@ import {
   deleteBucketObject,
   startMultipartUpload,
   createMultipartPartUrl,
+  uploadMultipartPart,
   listMultipartParts,
   completeMultipartUpload,
   abortMultipartUpload
@@ -613,11 +614,16 @@ function publicBucketMedia(item) {
     status:item.status || "UNKNOWN",
     probe:item.probe || null,
     profile,
-    preparedId:null,
-    preparedProbe:null,
-    preparedProfile:null,
-    preparedSize:null,
-    bitratePolicyVersion:BITRATE_POLICY_VERSION,
+    preparedId:item.preparedKey || null,
+    preparedKey:item.preparedKey || null,
+    preparedProbe:item.preparedProbe || null,
+    preparedProfile:item.preparedProfile || null,
+    preparedSize:item.preparedSize || null,
+    preparedTargetVideoBitrate:item.preparedTargetVideoBitrate || null,
+    prepareProgressPct:Number.isFinite(Number(item.prepareProgressPct)) ? Number(item.prepareProgressPct) : null,
+    prepareStartedAt:item.prepareStartedAt || null,
+    prepareError:item.prepareError || null,
+    bitratePolicyVersion:item.bitratePolicyVersion || BITRATE_POLICY_VERSION,
     recommendedVideoBitrate:profile?.recommendedVideoBitrate || profile?.bitratePolicy?.recommendedVideoBitrate || null,
     sourceVideoBitrate:profile?.bitratePolicy?.sourceVideoBitrate || null,
     prepareError:item.prepareError || null,
@@ -906,15 +912,18 @@ async function resolveStreamSource(mediaId) {
 
   const bucketItem = await getBucketMedia(id);
   if (bucketItem) {
-    if (bucketItem.status !== "READY_DIRECT" || !bucketItem.profile?.streamReady || bucketItem.profile.mode !== "copy") {
+    const effectiveKey = bucketItem.preparedKey || bucketItem.key;
+    const effectiveProbe = bucketItem.preparedProbe || bucketItem.probe;
+    const effectiveProfile = bucketItem.preparedProfile || bucketItem.profile;
+    if (bucketItem.status !== "READY_DIRECT" || !effectiveProfile?.streamReady || effectiveProfile.mode !== "copy") {
       throw new Error("media_requires_preparation");
     }
-    const streamPath = await createBucketReadUrl(bucketItem.key, 604800);
+    const streamPath = await createBucketReadUrl(effectiveKey, 604800);
     return {
       id,
       streamPath,
-      streamProbe:bucketItem.probe,
-      profile:bucketItem.profile
+      streamProbe:effectiveProbe,
+      profile:effectiveProfile
     };
   }
 
@@ -1172,6 +1181,267 @@ Slot ${id}: поток остановлен
 }
 
 
+function ffmpegTimeToSeconds(value) {
+  const m = String(value || "").match(/^(\d+):(\d+):(\d+(?:\.\d+)?)$/);
+  if (!m) return null;
+  return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+}
+
+async function prepareBucketMedia(mediaId) {
+  if (activeSlots.size > 0) throw new Error("cannot_prepare_while_streaming");
+
+  const id = path.basename(String(mediaId || ""));
+  if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
+
+  let item = await getBucketMedia(id);
+  if (!item) throw new Error("bucket_media_not_found");
+
+  const sourceProfile = item.profile || chooseProfile(item.probe || {});
+  if (sourceProfile.streamReady) {
+    item = {
+      ...item,
+      status:"READY_DIRECT",
+      prepareProgressPct:100,
+      prepareError:null,
+      updatedAt:new Date().toISOString()
+    };
+    await upsertBucketMedia(item);
+    return { state:"already_ready", mediaId:id, profile:sourceProfile };
+  }
+
+  const sourceUrl = await createBucketReadUrl(item.key, 21600);
+  const kbps = Number(sourceProfile.targetVideoBitrate || sourceProfile.recommendedVideoBitrate || 2500);
+  const preparedKey = "prepared/" + id.replace(/\.[^.]+$/, "") + "-" + crypto.randomUUID() + ".mp4";
+  const { uploadId } = await startMultipartUpload({ key:preparedKey, contentType:"video/mp4" });
+
+  const args = [
+    "-i",sourceUrl,
+    "-map","0:v:0",
+    "-map","0:a:0?",
+    "-c:v","libx264",
+    "-preset","veryfast",
+    "-pix_fmt","yuv420p",
+    "-r","30",
+    "-g","60",
+    "-keyint_min","60",
+    "-sc_threshold","0",
+    "-b:v",`${kbps}k`,
+    "-maxrate",`${kbps}k`,
+    "-bufsize",`${kbps * 2}k`,
+    "-c:a","aac",
+    "-b:a","128k",
+    "-ar","48000",
+    "-movflags","+frag_keyframe+empty_moov+default_base_moof",
+    "-f","mp4",
+    "-progress","pipe:2",
+    "-nostats",
+    "-loglevel","error",
+    "pipe:1"
+  ];
+
+  const child = spawn("ffmpeg", args, {
+    stdio:["ignore","pipe","pipe"],
+    shell:false
+  });
+
+  const startedAt = new Date().toISOString();
+  const job = {
+    mediaId:id,
+    preparedId:preparedKey,
+    pid:child.pid,
+    startedAt,
+    state:"preparing",
+    lastError:null,
+    metrics:{ fps:null, outTime:null, speed:null, progress:null },
+    child
+  };
+  prepareJob = job;
+
+  item = {
+    ...item,
+    status:"PREPARING",
+    preparedKey,
+    prepareUploadId:uploadId,
+    prepareStartedAt:startedAt,
+    prepareProgressPct:0,
+    preparedUploadedBytes:0,
+    preparedTargetVideoBitrate:kbps,
+    prepareError:null,
+    updatedAt:startedAt
+  };
+  await upsertBucketMedia(item);
+
+  void notifyTelegram(`🛠 Stream Harbor
+Подготовка большого видео началась
+Файл: ${item.originalName || id}
+Источник: Bucket
+Цель: ${kbps} Kbps`);
+
+  let stderrBuffer = "";
+  let latestPct = 0;
+  const durationSec = Number(item.probe?.duration || 0);
+
+  child.stderr.on("data", chunk => {
+    stderrBuffer += chunk.toString("utf8");
+    const lines = stderrBuffer.split(/\r?\n/);
+    stderrBuffer = lines.pop() || "";
+
+    for (const raw of lines) {
+      const line = sanitizeLog(raw.trim());
+      if (!line) continue;
+      const eq = line.indexOf("=");
+      if (eq > 0) {
+        const key = line.slice(0, eq);
+        const value = line.slice(eq + 1);
+        if (key === "fps") job.metrics.fps = value;
+        else if (key === "out_time") {
+          job.metrics.outTime = value;
+          const seconds = ffmpegTimeToSeconds(value);
+          if (durationSec > 0 && Number.isFinite(seconds)) {
+            latestPct = Math.max(latestPct, Math.min(99, (seconds / durationSec) * 100));
+          }
+        } else if (key === "speed") job.metrics.speed = value;
+        else if (key === "progress") job.metrics.progress = value;
+      } else {
+        job.lastError = line.slice(-800);
+      }
+    }
+  });
+
+  const exitPromise = new Promise(resolve => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+
+  const parts = [];
+  const PART_BYTES = 32 * 1024 * 1024;
+  let buffers = [];
+  let bufferedBytes = 0;
+  let uploadedBytes = 0;
+  let partNumber = 1;
+
+  const uploadPreparedPart = async body => {
+    const result = await uploadMultipartPart({
+      key:preparedKey,
+      uploadId,
+      partNumber,
+      body
+    });
+    parts.push({ PartNumber:result.PartNumber, ETag:result.ETag });
+    uploadedBytes += body.length;
+    partNumber += 1;
+
+    const current = await getBucketMedia(id);
+    if (current) {
+      await upsertBucketMedia({
+        ...current,
+        status:"PREPARING",
+        prepareProgressPct:Math.round(latestPct * 10) / 10,
+        preparedUploadedBytes:uploadedBytes,
+        updatedAt:new Date().toISOString()
+      });
+    }
+  };
+
+  try {
+    for await (const chunk of child.stdout) {
+      buffers.push(chunk);
+      bufferedBytes += chunk.length;
+
+      while (bufferedBytes >= PART_BYTES) {
+        const all = Buffer.concat(buffers, bufferedBytes);
+        const body = all.subarray(0, PART_BYTES);
+        const rest = all.subarray(PART_BYTES);
+        buffers = rest.length ? [rest] : [];
+        bufferedBytes = rest.length;
+        await uploadPreparedPart(body);
+      }
+    }
+
+    if (bufferedBytes > 0) {
+      await uploadPreparedPart(Buffer.concat(buffers, bufferedBytes));
+    }
+
+    const { code, signal } = await exitPromise;
+    if (code !== 0) {
+      throw new Error(job.lastError || `ffmpeg_exit_${code ?? signal}`);
+    }
+    if (!parts.length) throw new Error("prepared_output_empty");
+
+    await completeMultipartUpload({
+      key:preparedKey,
+      uploadId,
+      parts
+    });
+
+    const head = await headBucketObject(preparedKey);
+    if (!head.size) throw new Error("prepared_bucket_object_empty");
+
+    const preparedUrl = await createBucketReadUrl(preparedKey, 21600);
+    const preparedProbe = await analyzeRemoteMedia(preparedUrl, head.size);
+    const preparedProfile = chooseProfile(preparedProbe);
+    if (!preparedProfile.streamReady) {
+      throw new Error("prepared_file_not_stream_ready");
+    }
+
+    const completed = await getBucketMedia(id) || item;
+    await upsertBucketMedia({
+      ...completed,
+      status:"READY_DIRECT",
+      preparedKey,
+      prepareUploadId:null,
+      preparedSize:head.size,
+      preparedProbe,
+      preparedProfile,
+      preparedTargetVideoBitrate:kbps,
+      bitratePolicyVersion:BITRATE_POLICY_VERSION,
+      prepareProgressPct:100,
+      preparedUploadedBytes:head.size,
+      preparedAt:new Date().toISOString(),
+      prepareError:null,
+      updatedAt:new Date().toISOString()
+    });
+
+    void notifyTelegram(`✅ Stream Harbor
+Видео подготовлено и готово к эфиру
+Файл: ${completed.originalName || id}
+Размер готовой версии: ${(head.size/1024/1024).toFixed(1)} MB`);
+  } catch (err) {
+    try { child.kill("SIGTERM"); } catch {}
+    await abortMultipartUpload({ key:preparedKey, uploadId }).catch(() => {});
+    await deleteBucketObject(preparedKey).catch(() => {});
+
+    const message = sanitizeLog(err?.message || err);
+    const failed = await getBucketMedia(id) || item;
+    await upsertBucketMedia({
+      ...failed,
+      status:"PREPARE_FAILED",
+      prepareUploadId:null,
+      prepareError:message,
+      updatedAt:new Date().toISOString()
+    }).catch(() => {});
+
+    void notifyTelegram(`🚨 Stream Harbor
+Подготовка видео не удалась
+Файл: ${failed.originalName || id}
+Ошибка: ${message}`);
+  } finally {
+    if (prepareJob?.pid === child.pid) prepareJob = null;
+    setImmediate(() => runNextPrepareJob().catch(err => {
+      console.error(JSON.stringify({
+        event:"prepare_queue_runner_failed",
+        error:sanitizeLog(err?.message || err)
+      }));
+    }));
+  }
+
+  return {
+    state:"preparing",
+    mediaId:id,
+    preparedId:preparedKey,
+    pid:child.pid
+  };
+}
+
 async function prepareMedia(mediaId) {
   if (activeSlots.size > 0) throw new Error("cannot_prepare_while_streaming");
 
@@ -1381,8 +1651,9 @@ async function enqueuePrepare(mediaId) {
   const id = path.basename(String(mediaId || ""));
   if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
 
+  const bucketMeta = await getBucketMedia(id);
   const sourcePath = path.join(MEDIA_DIR, id);
-  await fs.access(sourcePath);
+  if (!bucketMeta) await fs.access(sourcePath);
 
   if (prepareJob?.mediaId === id) {
     return { state:"preparing", mediaId:id, position:0 };
@@ -1394,24 +1665,35 @@ async function enqueuePrepare(mediaId) {
   }
 
   if (!prepareJob) {
-    return await prepareMedia(id);
+    return bucketMeta ? await prepareBucketMedia(id) : await prepareMedia(id);
   }
 
-  const meta = await readMeta(id) || {
-    id,
-    originalName:id,
-    size:(await fs.stat(sourcePath)).size,
-    createdAt:new Date().toISOString()
-  };
+  const queuedAt = new Date().toISOString();
+  if (bucketMeta) {
+    await upsertBucketMedia({
+      ...bucketMeta,
+      status:"PREPARE_QUEUED",
+      queuedAt,
+      prepareError:null,
+      updatedAt:queuedAt
+    });
+  } else {
+    const meta = await readMeta(id) || {
+      id,
+      originalName:id,
+      size:(await fs.stat(sourcePath)).size,
+      createdAt:new Date().toISOString()
+    };
 
-  await writeMeta(id, {
-    ...meta,
-    status:"PREPARE_QUEUED",
-    queuedAt:new Date().toISOString(),
-    prepareError:null
-  });
+    await writeMeta(id, {
+      ...meta,
+      status:"PREPARE_QUEUED",
+      queuedAt,
+      prepareError:null
+    });
+  }
 
-  prepareQueue.push({ mediaId:id, queuedAt:new Date().toISOString() });
+  prepareQueue.push({ mediaId:id, queuedAt });
   queuedPrepareIds.add(id);
 
   return {
@@ -1429,15 +1711,28 @@ async function runNextPrepareJob() {
   queuedPrepareIds.delete(next.mediaId);
 
   try {
-    await prepareMedia(next.mediaId);
+    const bucketMeta = await getBucketMedia(next.mediaId);
+    if (bucketMeta) await prepareBucketMedia(next.mediaId);
+    else await prepareMedia(next.mediaId);
   } catch (err) {
-    const meta = await readMeta(next.mediaId).catch(() => null);
-    if (meta) {
-      await writeMeta(next.mediaId, {
-        ...meta,
+    const message = sanitizeLog(err?.message || err);
+    const bucketMeta = await getBucketMedia(next.mediaId);
+    if (bucketMeta) {
+      await upsertBucketMedia({
+        ...bucketMeta,
         status:"PREPARE_FAILED",
-        prepareError:sanitizeLog(err?.message || err)
+        prepareError:message,
+        updatedAt:new Date().toISOString()
       }).catch(() => {});
+    } else {
+      const meta = await readMeta(next.mediaId).catch(() => null);
+      if (meta) {
+        await writeMeta(next.mediaId, {
+          ...meta,
+          status:"PREPARE_FAILED",
+          prepareError:message
+        }).catch(() => {});
+      }
     }
 
     setImmediate(() => runNextPrepareJob().catch(() => {}));
@@ -1838,6 +2133,17 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
     await deleteBucketObject(bucketMeta.key).catch(err => {
       if (err?.name !== "NoSuchKey") throw err;
     });
+    if (bucketMeta.preparedKey) {
+      await deleteBucketObject(bucketMeta.preparedKey).catch(err => {
+        if (err?.name !== "NoSuchKey") throw err;
+      });
+    }
+    if (bucketMeta.prepareUploadId && bucketMeta.preparedKey) {
+      await abortMultipartUpload({
+        key:bucketMeta.preparedKey,
+        uploadId:bucketMeta.prepareUploadId
+      }).catch(() => {});
+    }
     await removeBucketMedia(id);
     return res.json({ ok:true, sourceType:"bucket" });
   }
@@ -1857,9 +2163,6 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
 
 app.post("/api/media/:id/prepare", requireOwner, async (req, res) => {
   try {
-    if (await getBucketMedia(path.basename(String(req.params.id || "")))) {
-      return res.status(409).json({ error:"bucket_media_requires_reexport" });
-    }
     const result = await enqueuePrepare(req.params.id);
     res.json({ ok:true, ...result });
   } catch (err) {

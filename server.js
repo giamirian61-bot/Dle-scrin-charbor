@@ -22,12 +22,30 @@ app.use(helmet());
 app.use(express.json({ limit: "1mb" }));
 app.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }));
 
+function safeEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
 function requireOwner(req, res, next) {
   const auth = req.get("authorization") || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!OWNER_TOKEN || token.length !== OWNER_TOKEN.length ||
-      !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(OWNER_TOKEN))) {
-    return res.status(401).json({ error: "unauthorized" });
+  let token = "";
+
+  if (auth.startsWith("Bearer ")) {
+    token = auth.slice(7);
+  } else if (auth.startsWith("Basic ")) {
+    try {
+      const decoded = Buffer.from(auth.slice(6), "base64").toString("utf8");
+      const split = decoded.indexOf(":");
+      const username = split >= 0 ? decoded.slice(0, split) : "";
+      const password = split >= 0 ? decoded.slice(split + 1) : "";
+      if (username === "owner") token = password;
+    } catch {}
+  }
+
+  if (!OWNER_TOKEN || !safeEqual(token, OWNER_TOKEN)) {
+    res.set("WWW-Authenticate", 'Basic realm="Stream Harbor Test"');
+    return res.status(401).send("Unauthorized");
   }
   next();
 }
@@ -52,6 +70,70 @@ async function probeFile(filePath) {
 }
 
 let active = null;
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[ch]));
+}
+
+app.get("/test-upload", requireOwner, (_req, res) => {
+  res.type("html").send(`<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stream Harbor Test Upload</title>
+<style>
+body{font-family:system-ui,Arial,sans-serif;background:#0b0f14;color:#e8eef5;max-width:760px;margin:40px auto;padding:0 20px}
+.card{background:#121923;border:1px solid #263241;border-radius:16px;padding:24px}
+h1{margin-top:0} input,button{font:inherit} input[type=file]{display:block;width:100%;margin:18px 0}
+button{background:#7c3aed;color:white;border:0;border-radius:10px;padding:12px 18px;cursor:pointer}
+small{color:#9fb0c3}.ok{color:#6ee7a8}.warn{color:#fbbf24}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Stream Harbor · Test Upload</h1>
+<p>Загрузите короткий тестовый MP4. После загрузки сервер автоматически проверит файл через ffprobe.</p>
+<form method="post" action="/test-upload" enctype="multipart/form-data">
+<input type="file" name="file" accept="video/mp4,video/quicktime,video/webm" required>
+<button type="submit">Загрузить и проверить</button>
+</form>
+<p><small>Тестовый лимит файла: до 400 MB. YouTube stream key здесь не используется.</small></p>
+</div>
+</body>
+</html>`);
+});
+
+app.post("/test-upload", requireOwner, upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).send("Файл не выбран");
+  try {
+    const probe = await probeFile(req.file.path);
+    const streams = probe.streams || [];
+    const video = streams.find(s => s.codec_type === "video");
+    const audio = streams.find(s => s.codec_type === "audio");
+    if (!video) throw new Error("No video stream detected");
+
+    res.type("html").send(`<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>READY</title>
+<style>body{font-family:system-ui,Arial,sans-serif;background:#0b0f14;color:#e8eef5;max-width:760px;margin:40px auto;padding:0 20px}.card{background:#121923;border:1px solid #263241;border-radius:16px;padding:24px}pre{white-space:pre-wrap;background:#080b10;padding:14px;border-radius:10px}.ok{color:#6ee7a8}a{color:#a78bfa}</style></head><body><div class="card">
+<h1 class="ok">READY</h1>
+<p><b>Файл:</b> ${escapeHtml(req.file.originalname)}</p>
+<p><b>Размер:</b> ${(req.file.size/1024/1024).toFixed(1)} MB</p>
+<pre>${escapeHtml(JSON.stringify({
+  id:req.file.filename,
+  duration:probe.format?.duration || null,
+  format:probe.format?.format_name || null,
+  video:video ? {codec:video.codec_name,width:video.width,height:video.height,pixFmt:video.pix_fmt,frameRate:video.avg_frame_rate} : null,
+  audio:audio ? {codec:audio.codec_name,sampleRate:audio.sample_rate,channels:audio.channels} : null
+}, null, 2))}</pre>
+<p><a href="/test-upload">Загрузить другой файл</a></p>
+</div></body></html>`);
+  } catch (err) {
+    await fs.unlink(req.file.path).catch(() => {});
+    res.status(422).type("html").send(`<h1>INVALID VIDEO</h1><pre>${escapeHtml(String(err.message || err))}</pre>`);
+  }
+});
 
 app.get("/health", (_req, res) => res.json({
   ok: true,

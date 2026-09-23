@@ -7,7 +7,8 @@ import {
   CreateMultipartUploadCommand,
   UploadPartCommand,
   CompleteMultipartUploadCommand,
-  AbortMultipartUploadCommand
+  AbortMultipartUploadCommand,
+  ListPartsCommand
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
@@ -131,6 +132,27 @@ export async function createMultipartPartUrl({ key, uploadId, partNumber, expire
     }),
     { expiresIn }
   );
+}
+
+export async function listMultipartParts({ key, uploadId }) {
+  requireBucket();
+  if (!uploadId) throw new Error("multipart_upload_id_missing");
+  const out = await s3.send(new ListPartsCommand({
+    Bucket: BUCKET,
+    Key: key,
+    UploadId: uploadId,
+    MaxParts: 1000
+  }));
+  const parts = Array.isArray(out.Parts) ? out.Parts : [];
+  return {
+    parts:parts.map(p => ({
+      partNumber:Number(p.PartNumber || 0),
+      size:Number(p.Size || 0),
+      etag:p.ETag || null,
+      lastModified:p.LastModified ? p.LastModified.toISOString() : null
+    })),
+    isTruncated:Boolean(out.IsTruncated)
+  };
 }
 
 export async function completeMultipartUpload({ key, uploadId, parts }) {

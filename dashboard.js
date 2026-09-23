@@ -103,6 +103,8 @@ function storageCard(m){
   const preparing=m.status==="PREPARING";
   const queued=m.status==="PREPARE_QUEUED";
   const bucket=m.sourceType==="bucket";
+  const uploading=m.status==="UPLOADING";
+  const analyzing=m.status==="ANALYZING";
   const source=m.sourceVideoBitrate;
   const target=m.recommendedVideoBitrate;
 
@@ -110,6 +112,8 @@ function storageCard(m){
   if(ready) action='<button class="btn secondary" disabled>READY</button>';
   else if(preparing) action='<button class="btn primary" disabled>Preparing…</button>';
   else if(queued) action='<button class="btn secondary" disabled>Queued</button>';
+  else if(uploading) action='<button class="btn secondary" disabled>Upload incomplete</button>';
+  else if(analyzing) action='<button class="btn secondary" disabled>Checking…</button>';
   else if(bucket) action='<button class="btn secondary" disabled>Needs re-export</button>';
   else action='<button class="btn primary prepareBtn">'+(optimize?'Optimize bitrate':'Prepare')+'</button>';
 
@@ -366,29 +370,57 @@ q("#addStreamBtn").addEventListener("click",async()=>{
 });
 q("#fileInput").addEventListener("change",async e=>{
   const f=e.target.files?.[0]; if(!f)return;
-  q("#uploadState").textContent="Preparing secure upload: "+f.name+"…";
+  q("#uploadState").textContent="Preparing multipart upload: "+f.name+"…";
+
+  let uploadId=null;
   try{
-    const prep=await api("/api/bucket/upload-url",{
+    const prep=await api("/api/bucket/multipart/start",{
       method:"POST",
       body:JSON.stringify({name:f.name,size:f.size,type:f.type||"video/mp4"})
     });
+    uploadId=prep.id;
 
-    const form=new FormData();
-    Object.entries(prep.fields||{}).forEach(([k,v])=>form.append(k,v));
-    form.append("file",f);
+    const parts=[];
+    const total=prep.totalParts;
+    const partSize=prep.partSize;
 
-    q("#uploadState").textContent="Uploading directly to Storage Bucket: "+f.name+"…";
-    const up=await fetch(prep.uploadUrl,{method:"POST",body:form});
-    if(!up.ok) throw new Error("Bucket upload failed: HTTP "+up.status);
+    for(let i=1;i<=total;i++){
+      const from=(i-1)*partSize;
+      const to=Math.min(f.size,from+partSize);
+      const blob=f.slice(from,to);
+      const pct=Math.floor((from/f.size)*100);
+      q("#uploadState").textContent="Uploading "+f.name+" · "+pct+"% · part "+i+"/"+total;
 
-    await api("/api/bucket/complete",{
+      let uploaded=false;
+      let lastErr=null;
+      for(let attempt=1;attempt<=3 && !uploaded;attempt++){
+        try{
+          const signed=await api("/api/bucket/multipart/"+encodeURIComponent(prep.id)+"/part-url",{
+            method:"POST",
+            body:JSON.stringify({partNumber:i})
+          });
+          const up=await fetch(signed.url,{method:"PUT",body:blob});
+          if(!up.ok) throw new Error("part "+i+" HTTP "+up.status);
+          const etag=up.headers.get("etag");
+          if(!etag) throw new Error("part "+i+" ETag missing");
+          parts.push({PartNumber:i,ETag:etag});
+          uploaded=true;
+        }catch(err){
+          lastErr=err;
+          if(attempt<3) await new Promise(r=>setTimeout(r,1500*attempt));
+        }
+      }
+      if(!uploaded) throw lastErr||new Error("part "+i+" failed");
+    }
+
+    q("#uploadState").textContent="Finalizing "+f.name+"…";
+    await api("/api/bucket/multipart/"+encodeURIComponent(prep.id)+"/complete",{
       method:"POST",
-      body:JSON.stringify({id:prep.id})
+      body:JSON.stringify({parts})
     });
 
     q("#uploadState").textContent="Uploaded. Checking video with ffprobe…";
-
-    const deadline=Date.now()+20*60*1000;
+    const deadline=Date.now()+30*60*1000;
     while(Date.now()<deadline){
       await new Promise(r=>setTimeout(r,3000));
       const media=await api("/api/bucket/media/"+encodeURIComponent(prep.id));
@@ -402,8 +434,14 @@ q("#fileInput").addEventListener("change",async e=>{
       }
     }
   }catch(err){
-    q("#uploadState").textContent="Upload failed";
-    toast(err.message,true);
+    q("#uploadState").textContent="Upload failed: "+(err?.message||err);
+    toast(err?.message||String(err),true);
+    if(uploadId){
+      api("/api/bucket/multipart/"+encodeURIComponent(uploadId)+"/abort",{
+        method:"POST",body:"{}"
+      }).catch(()=>{});
+    }
+    await refreshStorageOnly().catch(()=>{});
   }
   e.target.value="";
 });

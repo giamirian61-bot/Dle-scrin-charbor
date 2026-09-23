@@ -71,14 +71,17 @@ function streamCard(s){
 
     <div class="media-box">
       <div class="field"><label>Video from Storage</label><select class="select mediaId">${mediaOptions(s.mediaId)}</select></div>
-      <div class="media-meta">${media?esc((media.originalName||media.id)+" · "+media.status+" · "+fmtMb(media.preparedSize||media.size)):"No video selected"}</div>
+      <div class="media-meta">${media?esc(
+        (media.originalName||media.id)+" · "+media.status+" · "+fmtMb(media.preparedSize||media.size)
+        +(media.recommendedVideoBitrate?" · AUTO "+media.recommendedVideoBitrate+" Kbps":"")
+      ):"No video selected"}</div>
     </div>
 
     <div class="status-line">Worker: ${esc(runtime.state||"idle")} ${runtime.metrics?.bitrate?"· "+esc(runtime.metrics.bitrate):""} ${runtime.lastError?"· "+esc(runtime.lastError):""}</div>
 
     <div class="actions">
       <button class="btn secondary saveBtn">Save</button>
-      <button class="btn primary startBtn" ${live||!s.keyConfigured||!s.mediaId?"disabled":""}>▶ Start</button>
+      <button class="btn primary startBtn" ${live||!s.keyConfigured||!s.mediaId||media?.status!=="READY_DIRECT"?"disabled":""}>▶ Start</button>
       <button class="btn danger stopBtn" ${!live?"disabled":""}>■ Stop</button>
       <span class="spacer"></span>
       <button class="btn danger deleteBtn" ${live?"disabled":""}>Delete</button>
@@ -96,20 +99,27 @@ function storageCard(m){
   const p=m.preparedProbe||m.probe||{};
   const v=p.video||{};
   const ready=m.status==="READY_DIRECT";
+  const optimize=m.status==="OPTIMIZE_NEEDED";
+  const source=m.sourceVideoBitrate;
+  const target=m.recommendedVideoBitrate;
+
   return `<article class="storage-card" data-id="${esc(m.id)}">
     <h3>${esc(m.originalName||m.id)}</h3>
     <div class="storage-meta">
       <div>Status: ${esc(m.status||"UNKNOWN")}</div>
       <div>${esc(v.codec?String(v.codec).toUpperCase():"")} ${v.width&&v.height?esc(v.width+"×"+v.height):""}</div>
-      <div>${fmtMb(m.preparedSize||m.size)}</div>
+      <div>Size: ${fmtMb(m.preparedSize||m.size)}</div>
+      ${source?'<div>Source video bitrate: '+esc(source)+' Kbps</div>':""}
+      ${target?'<div><strong>Auto target: '+esc(target)+' Kbps</strong></div>':""}
     </div>
     <div class="storage-actions">
-      ${ready?'<button class="btn secondary" disabled>READY</button>':'<button class="btn primary prepareBtn">Prepare</button>'}
+      ${ready
+        ? '<button class="btn secondary" disabled>READY</button>'
+        : '<button class="btn primary prepareBtn">'+(optimize?'Optimize bitrate':'Prepare')+'</button>'}
       <button class="btn danger deleteMediaBtn">Delete</button>
     </div>
   </article>`;
 }
-
 function renderStorage(){
   q("#storageGrid").innerHTML=state.media.length?state.media.map(storageCard).join(""):'<div class="empty">No files uploaded yet.</div>';
   document.querySelectorAll(".prepareBtn").forEach(b=>b.addEventListener("click",async()=>{
@@ -154,6 +164,7 @@ function wireStreams(){
         if(meta){
           meta.textContent=media
             ? (media.originalName||media.id)+" · "+media.status+" · "+fmtMb(media.preparedSize||media.size)
+              +(media.recommendedVideoBitrate?" · AUTO "+media.recommendedVideoBitrate+" Kbps":"")
             : "No video selected";
         }
 
@@ -164,7 +175,7 @@ function wireStreams(){
         if(startBtn){
           const live=stream?.runtime?.state==="live_or_starting";
           const keyConfigured=Boolean(stream?.keyConfigured);
-          startBtn.disabled=live||!keyConfigured||!mediaId;
+          startBtn.disabled=live||!keyConfigured||!mediaId||media?.status!=="READY_DIRECT";
         }
 
         toast(mediaId?"Video assigned to stream":"Video removed from stream");
@@ -279,7 +290,8 @@ async function refreshRuntime(){
       const stopBtn=card.querySelector(".stopBtn");
       const deleteBtn=card.querySelector(".deleteBtn");
 
-      if(startBtn) startBtn.disabled=live||!incoming.keyConfigured||!mediaId;
+      const selectedMedia=state.media.find(m=>m.id===mediaId);
+      if(startBtn) startBtn.disabled=live||!incoming.keyConfigured||!mediaId||selectedMedia?.status!=="READY_DIRECT";
       if(stopBtn) stopBtn.disabled=!live;
       if(deleteBtn) deleteBtn.disabled=live;
     }

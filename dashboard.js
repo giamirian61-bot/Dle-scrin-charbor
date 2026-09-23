@@ -100,8 +100,16 @@ function storageCard(m){
   const v=p.video||{};
   const ready=m.status==="READY_DIRECT";
   const optimize=m.status==="OPTIMIZE_NEEDED";
+  const preparing=m.status==="PREPARING";
+  const queued=m.status==="PREPARE_QUEUED";
   const source=m.sourceVideoBitrate;
   const target=m.recommendedVideoBitrate;
+
+  let action;
+  if(ready) action='<button class="btn secondary" disabled>READY</button>';
+  else if(preparing) action='<button class="btn primary" disabled>Preparing…</button>';
+  else if(queued) action='<button class="btn secondary" disabled>Queued</button>';
+  else action='<button class="btn primary prepareBtn">'+(optimize?'Optimize bitrate':'Prepare')+'</button>';
 
   return `<article class="storage-card" data-id="${esc(m.id)}">
     <h3>${esc(m.originalName||m.id)}</h3>
@@ -114,25 +122,36 @@ function storageCard(m){
       ${target?'<div><strong>Auto target: '+esc(target)+' Kbps</strong></div>':""}
     </div>
     <div class="storage-actions">
-      ${ready
-        ? '<button class="btn secondary" disabled>READY</button>'
-        : '<button class="btn primary prepareBtn">'+(optimize?'Optimize bitrate':'Prepare')+'</button>'}
-      <button class="btn danger deleteMediaBtn">Delete</button>
+      ${action}
+      <button class="btn danger deleteMediaBtn" ${preparing||queued?'disabled':""}>Delete</button>
     </div>
   </article>`;
 }
 function renderStorage(){
   q("#storageGrid").innerHTML=state.media.length?state.media.map(storageCard).join(""):'<div class="empty">No files uploaded yet.</div>';
+
   document.querySelectorAll(".prepareBtn").forEach(b=>b.addEventListener("click",async()=>{
     const id=b.closest(".storage-card").dataset.id;
-    try{b.disabled=true;b.textContent="Preparing…";await api("/api/media/"+encodeURIComponent(id)+"/prepare",{method:"POST",body:"{}"});toast("Preparation started");pollPrepare();}
-    catch(e){toast(e.message,true);b.disabled=false}
+    try{
+      b.disabled=true;
+      const result=await api("/api/media/"+encodeURIComponent(id)+"/prepare",{method:"POST",body:"{}"});
+      toast(result.state==="queued" ? "Added to preparation queue" : "Preparation started");
+      await refreshStorageOnly();
+      pollPrepareQueue();
+    }catch(e){
+      toast(e.message,true);
+      await refreshStorageOnly();
+    }
   }));
+
   document.querySelectorAll(".deleteMediaBtn").forEach(b=>b.addEventListener("click",async()=>{
     const id=b.closest(".storage-card").dataset.id;
     if(!confirm("Delete this video from Storage?"))return;
-    try{await api("/api/media/"+encodeURIComponent(id),{method:"DELETE"});await loadAll();toast("Video deleted")}
-    catch(e){toast(e.message,true)}
+    try{
+      await api("/api/media/"+encodeURIComponent(id),{method:"DELETE"});
+      await refreshStorageOnly();
+      toast("Video deleted");
+    }catch(e){toast(e.message,true)}
   }));
 }
 
@@ -246,13 +265,38 @@ async function saveStream(card,id,silent=false){
   if(!silent) toast("Settings saved ✓");
 }
 
-async function pollPrepare(){
-  const timer=setInterval(async()=>{
+async function refreshStorageOnly(){
+  try{
+    const m=await api("/api/media");
+    state.media=m.items||[];
+    renderStorage();
+  }catch(e){
+    toast(e.message,true);
+  }
+}
+
+let preparePollTimer=null;
+async function pollPrepareQueue(){
+  if(preparePollTimer) return;
+
+  preparePollTimer=setInterval(async()=>{
     try{
-      const p=await api("/api/prepare/status");
-      if(p.state==="idle"){clearInterval(timer);await loadAll();toast("Preparation finished")}
-    }catch(e){clearInterval(timer)}
-  },3000);
+      const [p,m]=await Promise.all([api("/api/prepare/status"),api("/api/media")]);
+      state.media=m.items||[];
+      renderStorage();
+
+      const queueEmpty=!p.queue||p.queue.length===0;
+      if(p.state==="idle" && queueEmpty){
+        clearInterval(preparePollTimer);
+        preparePollTimer=null;
+        toast("Preparation queue finished");
+        await loadAll();
+      }
+    }catch(e){
+      clearInterval(preparePollTimer);
+      preparePollTimer=null;
+    }
+  },2000);
 }
 
 async function refreshRuntime(){
@@ -307,6 +351,9 @@ async function loadAll(){
     state.streams=s.items||[]; state.media=m.items||[];
     q("#serverStatus").textContent=h.ok?"Server online":"Server problem";
     renderStreams();renderStorage();
+    api("/api/prepare/status").then(p=>{
+      if(p.state!=="idle" || (p.queue&&p.queue.length)) pollPrepareQueue();
+    }).catch(()=>{});
   }catch(e){toast(e.message,true);q("#serverStatus").textContent="Connection error"}
 }
 

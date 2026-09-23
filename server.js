@@ -13,7 +13,11 @@ import {
   createVideoUploadPost,
   createBucketReadUrl,
   headBucketObject,
-  deleteBucketObject
+  deleteBucketObject,
+  startMultipartUpload,
+  createMultipartPartUrl,
+  completeMultipartUpload,
+  abortMultipartUpload
 } from "./bucket-storage.js";
 
 const execFileAsync = promisify(execFile);
@@ -32,6 +36,7 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const BITRATE_POLICY_VERSION = 2;
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 400 * 1024 * 1024);
 const MAX_BUCKET_FILE_BYTES = Number(process.env.MAX_BUCKET_FILE_BYTES || 8 * 1024 * 1024 * 1024);
+const MULTIPART_PART_BYTES = 64 * 1024 * 1024;
 const BUCKET_MEDIA_FILE = path.join(MEDIA_DIR, ".bucket-media.json");
 const LEGACY_STATE_FILE = path.join(MEDIA_DIR, ".stream-state.json");
 const SLOT_STATE_FILE = path.join(MEDIA_DIR, ".slots-state.json");
@@ -1431,10 +1436,10 @@ app.get("/api/media", requireOwner, async (_req, res) => {
   res.json({ items:[...bucketItems, ...localItems] });
 });
 
-app.post("/api/bucket/upload-url", requireOwner, async (req, res) => {
+app.post("/api/bucket/multipart/start", requireOwner, async (req, res) => {
   if (!bucketConfigured()) return res.status(503).json({ error:"bucket_not_configured" });
 
-  const originalName = normalizeOriginalName(String(req.body?.name || "video.mp4")).slice(0,240);
+  const originalName = String(req.body?.name || "video.mp4").trim().slice(0,240);
   const size = Number(req.body?.size || 0);
   const contentType = String(req.body?.type || "video/mp4");
 
@@ -1447,19 +1452,18 @@ app.post("/api/bucket/upload-url", requireOwner, async (req, res) => {
   const ext = path.extname(originalName).slice(0,10).replace(/[^.a-zA-Z0-9]/g,"") || ".mp4";
   const id = "bkt_" + crypto.randomUUID() + ext;
   const key = "media/" + id;
-
-  const upload = await createVideoUploadPost({
-    key,
-    contentType,
-    maxBytes:MAX_BUCKET_FILE_BYTES
-  });
+  const { uploadId } = await startMultipartUpload({ key, contentType });
+  const totalParts = Math.ceil(size / MULTIPART_PART_BYTES);
 
   const item = {
     id,
     key,
+    uploadId,
     originalName,
     size,
     contentType,
+    partSize:MULTIPART_PART_BYTES,
+    totalParts,
     status:"UPLOADING",
     createdAt:new Date().toISOString(),
     updatedAt:new Date().toISOString()
@@ -1468,10 +1472,88 @@ app.post("/api/bucket/upload-url", requireOwner, async (req, res) => {
 
   res.status(201).json({
     id,
-    uploadUrl:upload.url,
-    fields:upload.fields,
+    partSize:MULTIPART_PART_BYTES,
+    totalParts,
     maxBytes:MAX_BUCKET_FILE_BYTES
   });
+});
+
+app.post("/api/bucket/multipart/:id/part-url", requireOwner, async (req, res) => {
+  const id = path.basename(String(req.params.id || ""));
+  const item = await getBucketMedia(id);
+  if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+  if (!item.uploadId || item.status !== "UPLOADING") {
+    return res.status(409).json({ error:"multipart_upload_not_active" });
+  }
+
+  const partNumber = Number(req.body?.partNumber || 0);
+  if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > Number(item.totalParts || 0)) {
+    return res.status(400).json({ error:"invalid_part_number" });
+  }
+
+  const url = await createMultipartPartUrl({
+    key:item.key,
+    uploadId:item.uploadId,
+    partNumber,
+    expiresIn:3600
+  });
+  res.json({ url, partNumber });
+});
+
+app.post("/api/bucket/multipart/:id/complete", requireOwner, async (req, res) => {
+  const id = path.basename(String(req.params.id || ""));
+  let item = await getBucketMedia(id);
+  if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+  if (!item.uploadId) return res.status(409).json({ error:"multipart_upload_not_active" });
+
+  const parts = Array.isArray(req.body?.parts) ? req.body.parts : [];
+  if (parts.length !== Number(item.totalParts || 0)) {
+    return res.status(400).json({ error:"multipart_parts_incomplete" });
+  }
+
+  await completeMultipartUpload({
+    key:item.key,
+    uploadId:item.uploadId,
+    parts
+  });
+
+  const head = await headBucketObject(item.key);
+  if (!head.size) return res.status(422).json({ error:"bucket_object_empty" });
+  if (Math.abs(Number(head.size) - Number(item.size)) > 8) {
+    return res.status(422).json({ error:"bucket_object_size_mismatch" });
+  }
+
+  item = {
+    ...item,
+    uploadId:null,
+    size:head.size,
+    contentType:head.contentType || item.contentType || null,
+    status:"ANALYZING",
+    error:null,
+    updatedAt:new Date().toISOString()
+  };
+  await upsertBucketMedia(item);
+
+  void analyzeBucketMedia(id);
+  res.status(202).json({ ok:true, id, status:"ANALYZING" });
+});
+
+app.post("/api/bucket/multipart/:id/abort", requireOwner, async (req, res) => {
+  const id = path.basename(String(req.params.id || ""));
+  const item = await getBucketMedia(id);
+  if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+
+  if (item.uploadId) {
+    await abortMultipartUpload({ key:item.key, uploadId:item.uploadId }).catch(() => {});
+  }
+  await upsertBucketMedia({
+    ...item,
+    uploadId:null,
+    status:"ERROR",
+    error:"upload_aborted",
+    updatedAt:new Date().toISOString()
+  });
+  res.json({ ok:true });
 });
 
 app.post("/api/bucket/complete", requireOwner, async (req, res) => {
@@ -1558,6 +1640,9 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
 
   const bucketMeta = await getBucketMedia(id);
   if (bucketMeta) {
+    if (bucketMeta.uploadId) {
+      await abortMultipartUpload({ key:bucketMeta.key, uploadId:bucketMeta.uploadId }).catch(() => {});
+    }
     await deleteBucketObject(bucketMeta.key).catch(err => {
       if (err?.name !== "NoSuchKey") throw err;
     });

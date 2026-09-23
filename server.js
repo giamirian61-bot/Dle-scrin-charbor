@@ -1274,17 +1274,26 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Stream Harbor backend listening on ${PORT}`);
 
   setTimeout(async () => {
-    const state = await readState();
-    if (state.desired === "running" && state.mediaId && !active) {
+    const state = await readSlotsState();
+
+    for (const slotId of SLOT_IDS) {
+      const desired = state.slots[slotId] || { desired:"stopped" };
+      if (desired.desired !== "running" || !desired.mediaId || activeSlots.has(slotId)) continue;
+
       try {
-        await startStreamInternal(state.mediaId, { restore:true, retryCount:0 });
+        await startStreamInternal(slotId, desired.mediaId, {
+          restore:true,
+          retryCount:0
+        });
         console.log(JSON.stringify({
-          event:"stream_restored_after_restart",
-          mediaId:state.mediaId
+          event:"slot_restored_after_restart",
+          slotId,
+          mediaId:desired.mediaId
         }));
       } catch (err) {
         console.error(JSON.stringify({
-          event:"stream_restore_failed",
+          event:"slot_restore_failed",
+          slotId,
           error:sanitizeLog(err?.message || err)
         }));
       }
@@ -1294,11 +1303,13 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 
 async function gracefulShutdown(signal) {
   console.log(JSON.stringify({ event:"shutdown", signal }));
-  if (active?.child) {
+
+  for (const active of activeSlots.values()) {
     try {
-      active.child.kill("SIGTERM");
+      active.worker.kill("SIGTERM");
     } catch {}
   }
+
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 8000).unref();
 }

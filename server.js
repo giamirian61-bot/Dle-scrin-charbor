@@ -147,6 +147,32 @@ async function probeKeyframes(filePath) {
   };
 }
 
+function summarizeProbe(probe) {
+  const streams = probe.streams || [];
+  const video = streams.find(s => s.codec_type === "video");
+  const audio = streams.find(s => s.codec_type === "audio");
+
+  return {
+    duration:probe.format?.duration || null,
+    format:probe.format?.format_name || null,
+    formatBitRate:probe.format?.bit_rate || null,
+    video:video ? {
+      codec:video.codec_name,
+      width:video.width,
+      height:video.height,
+      pixFmt:video.pix_fmt,
+      frameRate:video.avg_frame_rate,
+      bitRate:video.bit_rate || null
+    } : null,
+    audio:audio ? {
+      codec:audio.codec_name,
+      sampleRate:audio.sample_rate,
+      channels:audio.channels,
+      bitRate:audio.bit_rate || null
+    } : null
+  };
+}
+
 async function analyzeFile(filePath) {
   const probe = await probeFile(filePath);
   const summary = summarizeProbe(probe);
@@ -955,12 +981,19 @@ async function listMedia() {
         };
         await writeMeta(name, meta);
       } catch (err) {
+        const analysisError = sanitizeLog(err?.message || err);
+        console.error(JSON.stringify({
+          event:"media_analysis_failed",
+          mediaId:name,
+          error:analysisError
+        }));
         meta = {
+          ...(meta || {}),
           id:name,
           size:st.size,
-          originalName:name,
+          originalName:meta?.originalName || name,
           status:"ERROR",
-          error:sanitizeLog(err?.message || err)
+          error:analysisError
         };
       }
     }
@@ -983,6 +1016,7 @@ async function listMedia() {
       recommendedVideoBitrate:meta?.profile?.recommendedVideoBitrate || meta?.profile?.bitratePolicy?.recommendedVideoBitrate || null,
       sourceVideoBitrate:meta?.profile?.bitratePolicy?.sourceVideoBitrate || null,
       prepareError:meta?.prepareError || null,
+      error:meta?.error || null,
       createdAt:meta?.createdAt || null
     });
   }

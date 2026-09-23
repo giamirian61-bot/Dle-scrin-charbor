@@ -1077,22 +1077,26 @@ async function api(url, options={}){
   if(!r.ok) throw new Error(JSON.stringify(data));
   return data;
 }
+
 async function refreshStatus(){
   try{
-    const d=await api("/api/stream/status");
+    const d=await api("/api/slots");
     document.getElementById("status").textContent=JSON.stringify(d,null,2);
-    const stop=document.getElementById("stopBtn");
-    if(stop) stop.disabled=d.state==="idle";
+    for(const s of d.slots||[]){
+      const btn=document.getElementById("stopSlot"+s.slotId);
+      if(btn) btn.disabled=s.state==="idle";
+    }
   }catch(e){
     document.getElementById("status").textContent=String(e);
   }
 }
-async function startStream(id){
-  if(!confirm("Запустить этот файл в YouTube по RTMPS?")) return;
+
+async function startSlot(slotId, mediaId){
+  if(!confirm("Запустить файл в slot "+slotId+"?")) return;
   try{
-    const d=await api("/api/stream/start",{
+    const d=await api("/api/slots/"+encodeURIComponent(slotId)+"/start",{
       method:"POST",
-      body:JSON.stringify({mediaId:id})
+      body:JSON.stringify({mediaId})
     });
     document.getElementById("status").textContent=JSON.stringify(d,null,2);
     setTimeout(refreshStatus,1500);
@@ -1101,21 +1105,39 @@ async function startStream(id){
     refreshStatus();
   }
 }
+
+async function stopSlotUi(slotId){
+  if(!confirm("Остановить slot "+slotId+"?")) return;
+  try{
+    const d=await api("/api/slots/"+encodeURIComponent(slotId)+"/stop",{
+      method:"POST",
+      body:"{}"
+    });
+    document.getElementById("status").textContent=JSON.stringify(d,null,2);
+    setTimeout(refreshStatus,1500);
+  }catch(e){
+    alert(e.message);
+    refreshStatus();
+  }
+}
+
 async function prepareMediaUi(id){
   if(!confirm("Подготовить файл один раз для стабильного DIRECT-стрима?")) return;
   const statusEl=document.getElementById("status");
-  statusEl.textContent="Подготовка файла... Это может занять несколько минут.";
+  statusEl.textContent="Подготовка файла...";
   try{
     const d=await api("/api/media/"+encodeURIComponent(id)+"/prepare",{
       method:"POST",
       body:"{}"
     });
     statusEl.textContent=JSON.stringify(d,null,2);
+
     const timer=setInterval(async()=>{
       try{
-        const s=await api("/api/prepare/status");
-        statusEl.textContent=JSON.stringify({stream:await api("/api/stream/status"),preparation:s},null,2);
-        if(s.state==="idle"){
+        const prep=await api("/api/prepare/status");
+        const slots=await api("/api/slots");
+        statusEl.textContent=JSON.stringify({slots:slots.slots,preparation:prep},null,2);
+        if(prep.state==="idle"){
           clearInterval(timer);
           location.reload();
         }
@@ -1129,24 +1151,17 @@ async function prepareMediaUi(id){
     refreshStatus();
   }
 }
-async function stopStream(){
-  if(!confirm("Остановить поток?")) return;
-  try{
-    const d=await api("/api/stream/stop",{method:"POST",body:"{}"});
-    document.getElementById("status").textContent=JSON.stringify(d,null,2);
-    setTimeout(refreshStatus,1500);
-  }catch(e){
-    alert(e.message);
-    refreshStatus();
-  }
-}
-document.querySelectorAll(".startBtn").forEach(btn => {
-  btn.addEventListener("click", () => startStream(btn.dataset.mediaId));
+
+document.querySelectorAll(".startSlotBtn").forEach(btn => {
+  btn.addEventListener("click", () => startSlot(btn.dataset.slotId, btn.dataset.mediaId));
 });
 document.querySelectorAll(".prepareBtn").forEach(btn => {
   btn.addEventListener("click", () => prepareMediaUi(btn.dataset.mediaId));
 });
-document.getElementById("stopBtn")?.addEventListener("click", stopStream);
+document.querySelectorAll(".stopSlotBtn").forEach(btn => {
+  btn.addEventListener("click", () => stopSlotUi(btn.dataset.slotId));
+});
+
 refreshStatus();
 setInterval(refreshStatus,5000);
 `);
@@ -1154,6 +1169,7 @@ setInterval(refreshStatus,5000);
 
 app.get("/test-control", requireOwner, async (_req, res) => {
   const files = await listMedia();
+  const state = await readSlotsState();
 
   const rows = files.map(f => {
     const ready = f.status === "READY_DIRECT";
@@ -1173,7 +1189,12 @@ app.get("/test-control", requireOwner, async (_req, res) => {
     if (f.status === "PREPARING") {
       action = `<button disabled>Preparing…</button>`;
     } else if (ready) {
-      action = `<button class="startBtn" data-media-id="${escapeHtml(f.id)}">Start stream</button>`;
+      action = `<div class="actions">
+        ${SLOT_IDS.map(slotId => streamKeyForSlot(slotId)
+          ? `<button class="startSlotBtn" data-slot-id="${slotId}" data-media-id="${escapeHtml(f.id)}">Start slot ${slotId}</button>`
+          : `<button disabled>Slot ${slotId}: key missing</button>`
+        ).join("")}
+      </div>`;
     } else {
       action = `<button class="prepareBtn" data-media-id="${escapeHtml(f.id)}">Prepare once</button>`;
     }
@@ -1189,6 +1210,18 @@ app.get("/test-control", requireOwner, async (_req, res) => {
       </div>`;
   }).join("");
 
+  const slotCards = SLOT_IDS.map(slotId => {
+    const slot = slotStatusPayload(slotId, state.slots[slotId]);
+    return `
+      <div class="slot">
+        <div>
+          <b>Slot ${slotId}</b><br>
+          <small>${slot.keyConfigured ? "YouTube key configured" : "YouTube key missing"} · desired: ${escapeHtml(slot.desired)}</small>
+        </div>
+        <button class="stop stopSlotBtn" id="stopSlot${slotId}" data-slot-id="${slotId}" ${slot.state === "idle" ? "disabled" : ""}>Stop slot ${slotId}</button>
+      </div>`;
+  }).join("");
+
   res.type("html").send(`<!doctype html>
 <html lang="ru">
 <head>
@@ -1196,11 +1229,14 @@ app.get("/test-control", requireOwner, async (_req, res) => {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Stream Harbor Control</title>
 <style>
-body{font-family:system-ui,Arial,sans-serif;background:#0b0f14;color:#e8eef5;max-width:860px;margin:40px auto;padding:0 20px}
+body{font-family:system-ui,Arial,sans-serif;background:#0b0f14;color:#e8eef5;max-width:980px;margin:40px auto;padding:0 20px}
 .card{background:#121923;border:1px solid #263241;border-radius:16px;padding:24px;margin-bottom:18px}
-.file{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:14px 0;border-top:1px solid #263241}
-button{font:inherit;background:#7c3aed;color:white;border:0;border-radius:10px;padding:12px 18px;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}
-.stop{background:#b42318}.status{font-family:ui-monospace,Consolas,monospace;background:#080b10;padding:14px;border-radius:10px;white-space:pre-wrap}
+.file,.slot{display:flex;gap:16px;align-items:center;justify-content:space-between;padding:14px 0;border-top:1px solid #263241}
+.actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}
+button{font:inherit;background:#7c3aed;color:white;border:0;border-radius:10px;padding:12px 18px;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+.stop{background:#b42318}
+.status{font-family:ui-monospace,Consolas,monospace;background:#080b10;padding:14px;border-radius:10px;white-space:pre-wrap}
 small{color:#9fb0c3}a{color:#a78bfa}
 </style>
 </head>
@@ -1210,11 +1246,17 @@ small{color:#9fb0c3}a{color:#a78bfa}
 <p><a href="/test-upload">Загрузить видео</a></p>
 <div id="files">${rows || "<p>Нет загруженных файлов.</p>"}</div>
 </div>
+
+<div class="card">
+<h2>Stream slots</h2>
+${slotCards}
+</div>
+
 <div class="card">
 <h2>Статус</h2>
 <div id="status" class="status">Проверяю...</div>
-<p><button class="stop" id="stopBtn">Stop stream</button></p>
 </div>
+
 <script src="/test-control.js" defer></script>
 </body>
 </html>`);

@@ -54,14 +54,20 @@ function streamCard(s){
     </div>
 
     <div class="field"><label>Description</label><textarea class="textarea description" placeholder="Description">${esc(s.description||"")}</textarea></div>
-    <div class="field"><label>YouTube channel / live URL</label><input class="input channelUrl" value="${esc(s.channelUrl||"")}" placeholder="https://youtube.com/@channel or live URL"></div>
+    <div class="field"><label>YouTube channel / live URL</label><input class="input channelUrl" value="${esc(s.channelUrl||"")}" placeholder="https://youtube.com/@YourChannel or https://youtube.com/live/…"><div class="field-help">This is only for identification. Do not paste the RTMPS server here.</div></div>
 
     <div class="field">
-      <label>Stream key ${s.keyConfigured?"· configured":""}</label>
-      <div class="key-row">
-        <input class="input streamKey" type="password" autocomplete="new-password" placeholder="${s.keyConfigured?"••••••••  Leave blank to keep existing key":"Enter stream key"}">
-        <button class="eye" type="button" title="Show/hide">◉</button>
+      <label>Stream key</label>
+      <div class="key-status ${s.keyConfigured?"saved":""}">
+        ${s.keyConfigured?"✓ Stream key saved":"Stream key not configured"}
       </div>
+      <div class="key-row">
+        <input class="input streamKey masked-key" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+          data-saved="${s.keyConfigured?"1":"0"}"
+          placeholder="${s.keyConfigured?"Enter a new key only to replace the saved one":"Enter stream key"}">
+        <button class="eye" type="button" title="Show/hide typed key" ${s.keyConfigured?"disabled":""}>◉</button>
+      </div>
+      <div class="field-help">${s.keyConfigured?"Saved key stays encrypted on the server. Leave this field blank to keep it.":"Paste the YouTube stream key here."}</div>
     </div>
 
     <div class="media-box">
@@ -126,7 +132,14 @@ function wireStreams(){
 
     card.querySelector(".eye").addEventListener("click",()=>{
       const inp=card.querySelector(".streamKey");
-      inp.type=inp.type==="password"?"text":"password";
+      if(!inp.value) return;
+      inp.classList.toggle("masked-key");
+    });
+
+    card.querySelector(".streamKey").addEventListener("input",e=>{
+      const eye=card.querySelector(".eye");
+      if(eye) eye.disabled=!e.target.value;
+      e.target.classList.add("masked-key");
     });
 
     card.querySelector(".mediaId").addEventListener("change",async e=>{
@@ -202,9 +215,26 @@ async function saveStream(card,id,silent=false){
   };
   const key=card.querySelector(".streamKey").value.trim();
   if(key) body.streamKey=key;
-  await api("/api/streams/"+encodeURIComponent(id),{method:"PATCH",body:JSON.stringify(body)});
-  card.querySelector(".streamKey").value="";
-  if(!silent){toast("Saved");await loadAll()}
+  const saved=await api("/api/streams/"+encodeURIComponent(id),{method:"PATCH",body:JSON.stringify(body)});
+  const keyInput=card.querySelector(".streamKey");
+  keyInput.value="";
+  keyInput.dataset.saved=saved.keyConfigured?"1":"0";
+  keyInput.placeholder=saved.keyConfigured?"Enter a new key only to replace the saved one":"Enter stream key";
+  keyInput.classList.add("masked-key");
+
+  const keyStatus=card.querySelector(".key-status");
+  if(keyStatus){
+    keyStatus.textContent=saved.keyConfigured?"✓ Stream key saved":"Stream key not configured";
+    keyStatus.classList.toggle("saved",saved.keyConfigured);
+  }
+
+  const eye=card.querySelector(".eye");
+  if(eye) eye.disabled=true;
+
+  const stream=state.streams.find(s=>s.id===id);
+  if(stream) stream.keyConfigured=Boolean(saved.keyConfigured);
+
+  if(!silent) toast("Settings saved ✓");
 }
 
 async function pollPrepare(){

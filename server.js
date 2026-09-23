@@ -10,6 +10,7 @@ import crypto from "node:crypto";
 
 const execFileAsync = promisify(execFile);
 const app = express();
+app.set("trust proxy", 1);
 const PORT = 3000;
 const MEDIA_DIR = process.env.MEDIA_DIR || "/data/media";
 const OWNER_TOKEN = process.env.OWNER_TOKEN || "";

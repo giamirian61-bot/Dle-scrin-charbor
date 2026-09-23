@@ -887,6 +887,8 @@ function buildFfmpegArgs(filePath, profile, target) {
     ...common,
     "-c:v","libx264",
     "-preset","veryfast",
+    "-threads","2",
+    "-x264-params","threads=2:lookahead_threads=1:sync-lookahead=0:rc-lookahead=10",
     "-pix_fmt","yuv420p",
     "-r","30",
     "-g","60",
@@ -1314,7 +1316,7 @@ async function prepareBucketMedia(mediaId) {
 
   void (async () => {
     const parts = [];
-    const PART_BYTES = 32 * 1024 * 1024;
+    const PART_BYTES = 8 * 1024 * 1024;
     let buffers = [];
     let bufferedBytes = 0;
     let uploadedBytes = 0;
@@ -1497,6 +1499,8 @@ async function prepareMedia(mediaId) {
     "-map","0:a:0?",
     "-c:v","libx264",
     "-preset","veryfast",
+    "-threads","2",
+    "-x264-params","threads=2:lookahead_threads=1:sync-lookahead=0:rc-lookahead=10",
     "-pix_fmt","yuv420p",
     "-r","30",
     "-g","60",

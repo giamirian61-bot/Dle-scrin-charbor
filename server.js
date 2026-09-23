@@ -19,6 +19,7 @@ const YOUTUBE_STREAM_KEY = process.env.YOUTUBE_STREAM_KEY || "";
 const YOUTUBE_RTMPS_BASE = process.env.YOUTUBE_RTMPS_BASE || "rtmps://a.rtmps.youtube.com/live2";
 const STREAM_SLOT_COUNT = Math.min(8, Math.max(1, Number(process.env.STREAM_SLOT_COUNT || 2)));
 const SLOT_IDS = Array.from({ length:STREAM_SLOT_COUNT }, (_, i) => String(i + 1));
+const BITRATE_POLICY_VERSION = 2;
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 400 * 1024 * 1024);
 const LEGACY_STATE_FILE = path.join(MEDIA_DIR, ".stream-state.json");
 const SLOT_STATE_FILE = path.join(MEDIA_DIR, ".slots-state.json");
@@ -149,6 +150,19 @@ async function probeKeyframes(filePath) {
 async function analyzeFile(filePath) {
   const probe = await probeFile(filePath);
   const summary = summarizeProbe(probe);
+  const stat = await fs.stat(filePath).catch(() => null);
+  const durationSec = Number(summary.duration || 0);
+
+  summary.fileSize = stat?.size || null;
+
+  if (!summary.formatBitRate && stat?.size && durationSec > 0) {
+    summary.estimatedTotalBitRate = Math.round((stat.size * 8) / durationSec);
+  } else {
+    summary.estimatedTotalBitRate = summary.formatBitRate
+      ? Number(summary.formatBitRate)
+      : null;
+  }
+
   const keyframes = summary.video ? await probeKeyframes(filePath) : {
     keyframeCount:0,
     maxKeyframeGap:null
@@ -158,35 +172,66 @@ async function analyzeFile(filePath) {
     keyframes
   };
 }
-
-function summarizeProbe(probe) {
-  const streams = probe.streams || [];
-  const video = streams.find(s => s.codec_type === "video");
-  const audio = streams.find(s => s.codec_type === "audio");
-  return {
-    duration: probe.format?.duration || null,
-    format: probe.format?.format_name || null,
-    video: video ? {
-      codec: video.codec_name,
-      width: video.width,
-      height: video.height,
-      pixFmt: video.pix_fmt,
-      frameRate: video.avg_frame_rate,
-      bitRate: video.bit_rate || null
-    } : null,
-    audio: audio ? {
-      codec: audio.codec_name,
-      sampleRate: audio.sample_rate,
-      channels: audio.channels,
-      bitRate: audio.bit_rate || null
-    } : null
-  };
-}
-
 function parseFps(rate) {
   if (!rate || !String(rate).includes("/")) return Number(rate || 0);
   const [n,d] = String(rate).split("/").map(Number);
   return d ? n / d : 0;
+}
+
+function adaptiveBitrateProfile(summary) {
+  const v = summary.video || {};
+  const a = summary.audio || {};
+  const fps = parseFps(v.frameRate) || 30;
+  const width = Number(v.width || 0);
+  const height = Number(v.height || 0);
+  const shortSide = Math.min(width || 99999, height || 99999);
+
+  const audioKbps = a
+    ? Math.max(64, Math.round(Number(a.bitRate || 128000) / 1000))
+    : 0;
+
+  let sourceVideoKbps = Number(v.bitRate || 0) / 1000;
+
+  if (!(sourceVideoKbps > 0)) {
+    const totalBps = Number(summary.estimatedTotalBitRate || summary.formatBitRate || 0);
+    if (totalBps > 0) {
+      sourceVideoKbps = Math.max(150, totalBps / 1000 - audioKbps);
+    }
+  }
+
+  // YouTube H.264 live-ingest upper targets. We use them as ceilings only.
+  // We never inflate a low-bitrate source merely because its resolution is high.
+  let youtubeCeilingKbps;
+  if (shortSide >= 2160) youtubeCeilingKbps = fps > 30 ? 35000 : 30000;
+  else if (shortSide >= 1440) youtubeCeilingKbps = fps > 30 ? 24000 : 15000;
+  else if (shortSide >= 1080) youtubeCeilingKbps = fps > 30 ? 12000 : 10000;
+  else if (shortSide >= 720) youtubeCeilingKbps = fps > 30 ? 6000 : 4000;
+  else if (shortSide >= 480) youtubeCeilingKbps = fps > 30 ? 2500 : 1800;
+  else youtubeCeilingKbps = fps > 30 ? 1500 : 1000;
+
+  // Re-encoding at exactly the same bitrate can cost quality, so keep a small 5% margin.
+  // Crucially, this does NOT jump a 700–800 Kbps clip to 2500 Kbps anymore.
+  let targetKbps;
+  if (sourceVideoKbps > 0) {
+    targetKbps = Math.min(youtubeCeilingKbps, sourceVideoKbps * 1.05);
+  } else {
+    // Conservative fallback only when the source exposes no usable bitrate at all.
+    targetKbps = Math.min(youtubeCeilingKbps, Math.max(600, shortSide >= 720 ? 1800 : 900));
+  }
+
+  targetKbps = Math.max(300, Math.round(targetKbps / 50) * 50);
+
+  return {
+    policyVersion:BITRATE_POLICY_VERSION,
+    sourceVideoBitrate:sourceVideoKbps > 0 ? Math.round(sourceVideoKbps) : null,
+    sourceTotalBitrate:summary.estimatedTotalBitRate
+      ? Math.round(Number(summary.estimatedTotalBitRate) / 1000)
+      : null,
+    recommendedVideoBitrate:targetKbps,
+    youtubeCeilingKbps,
+    audioBitrate:audioKbps,
+    duration:Number(summary.duration || 0) || null
+  };
 }
 
 function chooseProfile(summary) {
@@ -195,11 +240,14 @@ function chooseProfile(summary) {
   if (!v) return {
     streamReady:false,
     mode:"prepare",
-    reason:"no_video"
+    reason:"no_video",
+    bitratePolicy:adaptiveBitrateProfile(summary)
   };
 
   const fps = parseFps(v.frameRate);
   const keyframeGap = summary.keyframes?.maxKeyframeGap;
+  const bitratePolicy = adaptiveBitrateProfile(summary);
+
   const codecReady =
     v.codec === "h264" &&
     v.pixFmt === "yuv420p" &&
@@ -210,30 +258,37 @@ function chooseProfile(summary) {
     Number.isFinite(keyframeGap) &&
     keyframeGap <= 2.2;
 
-  if (codecReady && gopReady) {
+  // A file already compatible with YouTube stays untouched unless its bitrate
+  // is dramatically above the platform ceiling. Avoid needless generational loss.
+  const sourceKbps = bitratePolicy.sourceVideoBitrate;
+  const bitrateReady =
+    !sourceKbps ||
+    sourceKbps <= bitratePolicy.youtubeCeilingKbps * 1.10;
+
+  if (codecReady && gopReady && bitrateReady) {
     return {
       streamReady:true,
       mode:"copy",
       reason:"youtube_ready_passthrough",
-      targetVideoBitrate:null
+      targetVideoBitrate:null,
+      recommendedVideoBitrate:bitratePolicy.recommendedVideoBitrate,
+      bitratePolicy
     };
   }
-
-  const shortSide = Math.min(Number(v.width || 0), Number(v.height || 0));
-  let kbps = 1800;
-  if (shortSide >= 1080) kbps = 4500;
-  else if (shortSide >= 720) kbps = 2500;
-  else if (shortSide >= 480) kbps = 1500;
 
   return {
     streamReady:false,
     mode:"prepare",
-    reason:!codecReady ? "codec_normalization_required" : "keyframe_interval_too_long",
-    targetVideoBitrate:kbps,
-    detectedMaxKeyframeGap:keyframeGap
+    reason:
+      !codecReady ? "codec_normalization_required" :
+      !gopReady ? "keyframe_interval_too_long" :
+      "bitrate_above_youtube_ceiling",
+    targetVideoBitrate:bitratePolicy.recommendedVideoBitrate,
+    recommendedVideoBitrate:bitratePolicy.recommendedVideoBitrate,
+    detectedMaxKeyframeGap:keyframeGap,
+    bitratePolicy
   };
 }
-
 function streamKeyForSlot(slotId) {
   const id = String(slotId);
   const numbered = process.env[`YOUTUBE_STREAM_KEY_${id}`] || "";
@@ -482,6 +537,9 @@ async function resolveStreamSource(mediaId) {
   let profile = meta.profile;
 
   if (meta.preparedId) {
+    if (Number(meta?.bitratePolicyVersion || 0) < BITRATE_POLICY_VERSION) {
+      throw new Error("media_requires_bitrate_optimization");
+    }
     const preparedPath = path.join(MEDIA_DIR, path.basename(meta.preparedId));
     try {
       await fs.access(preparedPath);
@@ -711,7 +769,9 @@ async function prepareMedia(mediaId) {
       profile:sourceProfile,
       preparedId:null,
       preparedProbe:null,
-      preparedProfile:null
+      preparedProfile:null,
+      preparedTargetVideoBitrate:null,
+      bitratePolicyVersion:BITRATE_POLICY_VERSION
     };
     await writeMeta(id, meta);
     return {
@@ -833,6 +893,8 @@ async function prepareMedia(mediaId) {
         preparedSize:preparedStat.size,
         preparedProbe,
         preparedProfile,
+        preparedTargetVideoBitrate:kbps,
+        bitratePolicyVersion:BITRATE_POLICY_VERSION,
         preparedAt:new Date().toISOString(),
         prepareError:null
       });
@@ -873,7 +935,7 @@ async function listMedia() {
     if (!st?.isFile()) continue;
 
     let meta = await readMeta(name);
-    if (!meta?.probe || !meta?.profile) {
+    if (!meta?.probe || !meta?.profile || Number(meta?.profile?.bitratePolicy?.policyVersion || 0) < BITRATE_POLICY_VERSION) {
       try {
         const analysis = await analyzeFile(full);
         meta = {
@@ -881,7 +943,9 @@ async function listMedia() {
           id:name,
           size:st.size,
           originalName:meta?.originalName || name,
-          status:chooseProfile(analysis).streamReady ? "READY_DIRECT" : "PREPARE_NEEDED",
+          status:meta?.preparedId
+            ? (Number(meta?.bitratePolicyVersion || 0) < BITRATE_POLICY_VERSION ? "OPTIMIZE_NEEDED" : "READY_DIRECT")
+            : (chooseProfile(analysis).streamReady ? "READY_DIRECT" : "PREPARE_NEEDED"),
           createdAt:meta?.createdAt || new Date(st.birthtimeMs || Date.now()).toISOString(),
           probe:analysis,
           profile:chooseProfile(analysis)
@@ -902,13 +966,19 @@ async function listMedia() {
       id:name,
       size:st.size,
       originalName:meta?.originalName || name,
-      status:meta?.preparedId ? "READY_DIRECT" : (meta?.profile?.streamReady ? "READY_DIRECT" : meta?.status || "PREPARE_NEEDED"),
+      status:meta?.preparedId
+        ? (Number(meta?.bitratePolicyVersion || 0) < BITRATE_POLICY_VERSION ? "OPTIMIZE_NEEDED" : "READY_DIRECT")
+        : (meta?.profile?.streamReady ? "READY_DIRECT" : meta?.status || "PREPARE_NEEDED"),
       probe:meta?.probe || null,
       profile:meta?.profile || null,
       preparedId:meta?.preparedId || null,
       preparedProbe:meta?.preparedProbe || null,
       preparedProfile:meta?.preparedProfile || null,
       preparedSize:meta?.preparedSize || null,
+      preparedTargetVideoBitrate:meta?.preparedTargetVideoBitrate || null,
+      bitratePolicyVersion:meta?.bitratePolicyVersion || 0,
+      recommendedVideoBitrate:meta?.profile?.recommendedVideoBitrate || meta?.profile?.bitratePolicy?.recommendedVideoBitrate || null,
+      sourceVideoBitrate:meta?.profile?.bitratePolicy?.sourceVideoBitrate || null,
       prepareError:meta?.prepareError || null,
       createdAt:meta?.createdAt || null
     });
@@ -997,6 +1067,7 @@ app.post("/api/media/:id/prepare", requireOwner, async (req, res) => {
       msg === "cannot_prepare_while_streaming" ? 409 :
       msg === "invalid_media_id" ? 400 :
       msg === "media_requires_preparation" ? 409 :
+    msg === "media_requires_bitrate_optimization" ? 409 :
       msg.includes("ENOENT") ? 404 : 422;
     res.status(status).json({ error:msg });
   }

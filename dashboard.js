@@ -104,7 +104,9 @@ function storageCard(m){
   const queued=m.status==="PREPARE_QUEUED";
   const bucket=m.sourceType==="bucket";
   const uploading=m.status==="UPLOADING";
+  const stalled=m.status==="STALLED";
   const analyzing=m.status==="ANALYZING";
+  const progressPct=Math.max(0,Math.min(100,Math.round(Number(m.progressPct||0))));
   const source=m.sourceVideoBitrate;
   const target=m.recommendedVideoBitrate;
 
@@ -112,7 +114,8 @@ function storageCard(m){
   if(ready) action='<button class="btn secondary" disabled>READY</button>';
   else if(preparing) action='<button class="btn primary" disabled>Preparing…</button>';
   else if(queued) action='<button class="btn secondary" disabled>Queued</button>';
-  else if(uploading) action='<button class="btn secondary" disabled>Upload incomplete</button>';
+  else if(uploading) action='<button class="btn secondary" disabled>Uploading '+progressPct+'%</button>';
+  else if(stalled) action='<button class="btn danger" disabled>UPLOAD STALLED</button>';
   else if(analyzing) action='<button class="btn secondary" disabled>Checking…</button>';
   else if(bucket) action='<button class="btn secondary" disabled>Needs re-export</button>';
   else action='<button class="btn primary prepareBtn">'+(optimize?'Optimize bitrate':'Prepare')+'</button>';
@@ -122,6 +125,8 @@ function storageCard(m){
     <div class="storage-meta">
       <div>Status: ${esc(m.status||"UNKNOWN")}</div>
       ${m.error?'<div class="storage-error">Error: '+esc(m.error)+'</div>':""}
+      ${(uploading||stalled)?'<div class="upload-progress-label">'+progressPct+'% · '+esc(m.uploadedParts||0)+'/'+esc(m.totalParts||0)+' parts</div><div class="upload-progress"><span style="width:'+progressPct+'%"></span></div>':""}
+      ${m.lastProgressAt&&(uploading||stalled)?'<div>Last progress: '+esc(new Date(m.lastProgressAt).toLocaleTimeString())+'</div>':""}
       <div>${esc(v.codec?String(v.codec).toUpperCase():"")} ${v.width&&v.height?esc(v.width+"×"+v.height):""}</div>
       <div>Size: ${fmtMb(m.preparedSize||m.size)}</div>
       ${source?'<div>Source video bitrate: '+esc(source)+' Kbps</div>':""}
@@ -379,6 +384,7 @@ q("#fileInput").addEventListener("change",async e=>{
       body:JSON.stringify({name:f.name,size:f.size,type:f.type||"video/mp4"})
     });
     uploadId=prep.id;
+    await refreshStorageOnly().catch(()=>{});
 
     const parts=[];
     const total=prep.totalParts;
@@ -404,6 +410,12 @@ q("#fileInput").addEventListener("change",async e=>{
           const etag=up.headers.get("etag");
           if(!etag) throw new Error("part "+i+" ETag missing");
           parts.push({PartNumber:i,ETag:etag});
+          const donePct=Math.floor((to/f.size)*100);
+          q("#uploadState").textContent="Uploading "+f.name+" · "+donePct+"% · part "+i+"/"+total;
+          await api("/api/bucket/multipart/"+encodeURIComponent(prep.id)+"/progress",{
+            method:"POST",
+            body:JSON.stringify({partNumber:i,uploadedBytes:to,progressPct:donePct})
+          }).catch(()=>{});
           uploaded=true;
         }catch(err){
           lastErr=err;
@@ -449,3 +461,8 @@ q("#fileInput").addEventListener("change",async e=>{
 setView("streams");
 loadAll();
 setInterval(refreshRuntime,5000);
+setInterval(()=>{
+  if(!q("#storageView").classList.contains("hidden")){
+    refreshStorageOnly().catch(()=>{});
+  }
+},5000);

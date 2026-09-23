@@ -50,11 +50,10 @@ function streamCard(s){
 
     <div class="grid2">
       <div class="field"><label>Name</label><input class="input name" value="${esc(s.name||"")}" placeholder="Stream name"></div>
-      <div class="field"><label>RTMPS server</label><input class="input rtmpUrl" value="${esc(s.rtmpUrl||"rtmps://a.rtmps.youtube.com/live2")}" placeholder="rtmps://a.rtmps.youtube.com/live2"></div>
+      <div class="field"><label>Platform</label><input class="input" value="YouTube" disabled></div>
     </div>
 
     <div class="field"><label>Description</label><textarea class="textarea description" placeholder="Description">${esc(s.description||"")}</textarea></div>
-    <div class="field"><label>YouTube channel / live URL</label><input class="input channelUrl" value="${esc(s.channelUrl||"")}" placeholder="https://youtube.com/@YourChannel or https://youtube.com/live/…"><div class="field-help">This is only for identification. Do not paste the RTMPS server here.</div></div>
 
     <div class="field">
       <label>Stream key</label>
@@ -209,8 +208,6 @@ async function saveStream(card,id,silent=false){
   const body={
     name:card.querySelector(".name").value.trim(),
     description:card.querySelector(".description").value.trim(),
-    channelUrl:card.querySelector(".channelUrl").value.trim(),
-    rtmpUrl:card.querySelector(".rtmpUrl").value.trim(),
     mediaId:card.querySelector(".mediaId").value||null
   };
   const key=card.querySelector(".streamKey").value.trim();

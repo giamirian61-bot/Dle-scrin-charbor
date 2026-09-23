@@ -2,7 +2,7 @@ import express from "express";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import multer from "multer";
-import { spawn, execFile } from "node:child_process";
+import { spawn, execFile, fork } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -16,9 +16,13 @@ const PORT = 3000;
 const MEDIA_DIR = process.env.MEDIA_DIR || "/data/media";
 const OWNER_TOKEN = process.env.OWNER_TOKEN || "";
 const YOUTUBE_STREAM_KEY = process.env.YOUTUBE_STREAM_KEY || "";
+const YOUTUBE_STREAM_KEY_1 = process.env.YOUTUBE_STREAM_KEY_1 || YOUTUBE_STREAM_KEY;
+const YOUTUBE_STREAM_KEY_2 = process.env.YOUTUBE_STREAM_KEY_2 || "";
 const YOUTUBE_RTMPS_BASE = process.env.YOUTUBE_RTMPS_BASE || "rtmps://a.rtmps.youtube.com/live2";
+const SLOT_IDS = ["1","2"];
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 400 * 1024 * 1024);
-const STATE_FILE = path.join(MEDIA_DIR, ".stream-state.json");
+const LEGACY_STATE_FILE = path.join(MEDIA_DIR, ".stream-state.json");
+const SLOT_STATE_FILE = path.join(MEDIA_DIR, ".slots-state.json");
 
 await fs.mkdir(MEDIA_DIR, { recursive: true });
 
@@ -226,18 +230,60 @@ function chooseProfile(summary) {
   };
 }
 
-async function readState() {
+function streamKeyForSlot(slotId) {
+  if (String(slotId) === "1") return YOUTUBE_STREAM_KEY_1;
+  if (String(slotId) === "2") return YOUTUBE_STREAM_KEY_2;
+  return "";
+}
+
+function defaultSlotState() {
+  return {
+    slots:{
+      "1":{ desired:"stopped" },
+      "2":{ desired:"stopped" }
+    }
+  };
+}
+
+async function readSlotsState() {
   try {
-    return JSON.parse(await fs.readFile(STATE_FILE, "utf8"));
+    const parsed = JSON.parse(await fs.readFile(SLOT_STATE_FILE, "utf8"));
+    return {
+      slots:{
+        "1":{ desired:"stopped", ...(parsed?.slots?.["1"] || {}) },
+        "2":{ desired:"stopped", ...(parsed?.slots?.["2"] || {}) }
+      }
+    };
+  } catch {}
+
+  // One-time compatibility with the original single-stream state file.
+  try {
+    const legacy = JSON.parse(await fs.readFile(LEGACY_STATE_FILE, "utf8"));
+    const state = defaultSlotState();
+    state.slots["1"] = {
+      desired:legacy?.desired || "stopped",
+      ...(legacy?.mediaId ? { mediaId:legacy.mediaId } : {})
+    };
+    await writeSlotsState(state);
+    return state;
   } catch {
-    return { desired:"stopped" };
+    return defaultSlotState();
   }
 }
 
-async function writeState(state) {
-  const tmp = STATE_FILE + ".tmp";
+async function writeSlotsState(state) {
+  const tmp = SLOT_STATE_FILE + ".tmp";
   await fs.writeFile(tmp, JSON.stringify(state, null, 2), "utf8");
-  await fs.rename(tmp, STATE_FILE);
+  await fs.rename(tmp, SLOT_STATE_FILE);
+}
+
+async function updateSlotState(slotId, patch) {
+  const id = String(slotId);
+  if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
+  const state = await readSlotsState();
+  state.slots[id] = { ...(state.slots[id] || {desired:"stopped"}), ...patch };
+  await writeSlotsState(state);
+  return state.slots[id];
 }
 
 async function readMeta(id) {
@@ -256,8 +302,8 @@ async function writeMeta(id, meta) {
   );
 }
 
-let active = null;
-let restartTimer = null;
+const activeSlots = new Map();
+const restartTimers = new Map();
 let prepareJob = null;
 
 function buildFfmpegArgs(filePath, profile, target) {

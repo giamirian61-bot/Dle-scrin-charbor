@@ -538,6 +538,35 @@ function decryptSecret(payload) {
   }
 }
 
+function normalizeChannelUrl(value, { legacy=false } = {}) {
+  let v = String(value || "").trim().slice(0,500);
+  if (!v) return "";
+
+  if (/^rtmps?:\/\//i.test(v)) return "";
+
+  if (/^(?:www\.)?youtube\.com\//i.test(v) || /^youtu\.be\//i.test(v)) {
+    v = "https://" + v;
+  }
+
+  if (!/^https?:\/\//i.test(v)) {
+    if (legacy) return "";
+    throw new Error("invalid_channel_url");
+  }
+
+  try {
+    const parsed = new URL(v);
+    if (!["http:","https:"].includes(parsed.protocol)) {
+      if (legacy) return "";
+      throw new Error("invalid_channel_url");
+    }
+    return parsed.toString();
+  } catch {
+    if (legacy) return "";
+    throw new Error("invalid_channel_url");
+  }
+}
+
+
 async function writeStreamConfigs(items) {
   const tmp = STREAM_CONFIGS_FILE + ".tmp";
   await fs.writeFile(tmp, JSON.stringify({ items }, null, 2), "utf8");
@@ -547,7 +576,20 @@ async function writeStreamConfigs(items) {
 async function readStreamConfigs() {
   try {
     const parsed = JSON.parse(await fs.readFile(STREAM_CONFIGS_FILE, "utf8"));
-    return Array.isArray(parsed?.items) ? parsed.items : [];
+    const items = Array.isArray(parsed?.items) ? parsed.items : [];
+    let changed = false;
+
+    for (const item of items) {
+      const normalized = normalizeChannelUrl(item?.channelUrl || "", { legacy:true });
+      if (normalized !== String(item?.channelUrl || "")) {
+        item.channelUrl = normalized;
+        item.updatedAt = new Date().toISOString();
+        changed = true;
+      }
+    }
+
+    if (changed) await writeStreamConfigs(items);
+    return items;
   } catch {}
 
   // Migration: create the first card from the already working slot 1.
@@ -659,7 +701,7 @@ function publicStreamConfig(item, state) {
     slotId:String(item.slotId),
     name:item.name || `Stream ${item.slotId}`,
     description:item.description || "",
-    channelUrl:item.channelUrl || "",
+    channelUrl:normalizeChannelUrl(item.channelUrl || "", { legacy:true }),
     rtmpUrl:item.rtmpUrl || YOUTUBE_RTMPS_BASE,
     mediaId:item.mediaId || null,
     keyConfigured:Boolean(decryptSecret(item.keySecret) || streamKeyForSlot(String(item.slotId))),
@@ -3244,11 +3286,11 @@ app.patch("/api/streams/:id", requireOwner, async (req, res) => {
   if (req.body?.name !== undefined) next.name = String(req.body.name || "").slice(0,120);
   if (req.body?.description !== undefined) next.description = String(req.body.description || "").slice(0,1000);
   if (req.body?.channelUrl !== undefined) {
-    const value = String(req.body.channelUrl || "").trim().slice(0,500);
-    if (value && !/^https?:\/\//i.test(value)) {
+    try {
+      next.channelUrl = normalizeChannelUrl(req.body.channelUrl);
+    } catch {
       return res.status(400).json({ error:"invalid_channel_url" });
     }
-    next.channelUrl = value;
   }
   if (req.body?.rtmpUrl !== undefined) {
     if (live && String(req.body.rtmpUrl || "").trim() !== String(current.rtmpUrl || YOUTUBE_RTMPS_BASE)) {

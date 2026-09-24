@@ -2566,6 +2566,7 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
       }).catch(() => {});
     }
     await removeBucketMedia(id);
+    await removeCachedMedia(id).catch(() => {});
     return res.json({ ok:true, sourceType:"bucket" });
   }
 
@@ -3160,10 +3161,22 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error:"internal_error" });
 });
 
-const server = await readBucketMediaState();
+await readBucketMediaState();
 
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Stream Harbor backend listening on ${PORT}`);
+  streamCacheDiskInfo()
+    .then(info => console.log(JSON.stringify({
+      event:"stream_cache_storage",
+      dir:STREAM_CACHE_DIR,
+      totalBytes:info.totalBytes,
+      availableBytes:info.availableBytes,
+      reserveBytes:STREAM_CACHE_RESERVE_BYTES
+    })))
+    .catch(err => console.error(JSON.stringify({
+      event:"stream_cache_storage_error",
+      error:sanitizeLog(err?.message || err)
+    })));
   if (bucketConfigured()) {
     const origin = process.env.RAILWAY_PUBLIC_DOMAIN
       ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`

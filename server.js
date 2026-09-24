@@ -2743,6 +2743,7 @@ app.get("/api/bucket/media/:id", requireOwner, async (req, res) => {
 });
 
 app.get("/api/media/:id/cache-status", requireOwner, async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
   try {
     const id = path.basename(String(req.params.id || ""));
     const item = await getBucketMedia(id);
@@ -2752,22 +2753,53 @@ app.get("/api/media/:id/cache-status", requireOwner, async (req, res) => {
     const effectiveSize = Number(item.preparedSize || item.size || 0);
     const cachePath = streamCacheKeyPath(id, effectiveKey);
 
-    if (streamCacheJobs.has(cachePath)) {
-      return res.json({ state:"caching", mediaId:id });
-    }
-
     try {
       const st = await fs.stat(cachePath);
       if (!effectiveSize || Number(st.size) === effectiveSize) {
         return res.json({
           state:"cached",
           mediaId:id,
-          size:st.size
+          size:Number(st.size || 0),
+          expectedSize:effectiveSize || Number(st.size || 0),
+          progressPct:100
         });
       }
     } catch {}
 
-    res.json({ state:"not_cached", mediaId:id });
+    if (streamCacheJobs.has(cachePath)) {
+      let partialBytes = 0;
+      try {
+        const dir = path.dirname(cachePath);
+        const prefix = path.basename(cachePath) + ".part-";
+        const entries = await fs.readdir(dir, { withFileTypes:true });
+        for (const entry of entries) {
+          if (!entry.isFile() || !entry.name.startsWith(prefix)) continue;
+          try {
+            const st = await fs.stat(path.join(dir, entry.name));
+            partialBytes = Math.max(partialBytes, Number(st.size || 0));
+          } catch {}
+        }
+      } catch {}
+
+      const progressPct = effectiveSize
+        ? Math.max(0, Math.min(99, Math.floor((partialBytes / effectiveSize) * 100)))
+        : 0;
+
+      return res.json({
+        state:"caching",
+        mediaId:id,
+        partialBytes,
+        expectedSize:effectiveSize || null,
+        progressPct
+      });
+    }
+
+    res.json({
+      state:"not_cached",
+      mediaId:id,
+      expectedSize:effectiveSize || null,
+      progressPct:0
+    });
   } catch (err) {
     res.status(422).json({ error:sanitizeLog(err?.message || err) });
   }

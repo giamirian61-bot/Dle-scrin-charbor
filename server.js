@@ -574,7 +574,27 @@ async function writeMeta(id, meta) {
 async function readBucketMediaState() {
   try {
     const parsed = JSON.parse(await fs.readFile(BUCKET_MEDIA_FILE, "utf8"));
-    return { items:Array.isArray(parsed?.items) ? parsed.items : [] };
+    const items = Array.isArray(parsed?.items) ? parsed.items : [];
+    let changed = false;
+
+    for (const item of items) {
+      for (const key of ["prepareError","verificationError","error"]) {
+        if (typeof item?.[key] !== "string") continue;
+        const safe = sanitizeLog(item[key]);
+        if (safe !== item[key]) {
+          item[key] = safe;
+          changed = true;
+        }
+      }
+    }
+
+    if (changed) {
+      const tmp = BUCKET_MEDIA_FILE + ".sanitize.tmp";
+      await fs.writeFile(tmp, JSON.stringify({ items }, null, 2), "utf8");
+      await fs.rename(tmp, BUCKET_MEDIA_FILE);
+    }
+
+    return { items };
   } catch {
     return { items:[] };
   }
@@ -1194,14 +1214,28 @@ function ffmpegTimeToSeconds(value) {
   return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
 }
 
+const bucketVerificationJobs = new Set();
+
 async function verifyPreparedBucketMedia(mediaId) {
   const id = path.basename(String(mediaId || ""));
   if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
 
-  let item = await getBucketMedia(id);
-  if (!item) throw new Error("bucket_media_not_found");
-  if (!item.preparedKey) throw new Error("prepared_object_missing");
+  if (bucketVerificationJobs.has(id)) {
+    return { state:"verifying", mediaId:id };
+  }
+  bucketVerificationJobs.add(id);
 
+  let item = await getBucketMedia(id);
+  if (!item) {
+    bucketVerificationJobs.delete(id);
+    throw new Error("bucket_media_not_found");
+  }
+  if (!item.preparedKey) {
+    bucketVerificationJobs.delete(id);
+    throw new Error("prepared_object_missing");
+  }
+
+  try {
   const head = await headBucketObject(item.preparedKey);
   if (!head.size) throw new Error("prepared_bucket_object_empty");
 
@@ -1287,6 +1321,9 @@ async function verifyPreparedBucketMedia(mediaId) {
     mediaId:id,
     error:message
   };
+  } finally {
+    bucketVerificationJobs.delete(id);
+  }
 }
 
 async function prepareBucketMedia(mediaId) {
@@ -2283,8 +2320,19 @@ app.post("/api/media/:id/verify-prepared", requireOwner, async (req, res) => {
     const item = await getBucketMedia(id);
     if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
     if (!item.preparedKey) return res.status(409).json({ error:"prepared_object_missing" });
-    const result = await verifyPreparedBucketMedia(id);
-    res.json({ ok:result.state === "ready", ...result });
+    if (bucketVerificationJobs.has(id) || item.status === "VERIFYING") {
+      return res.json({ ok:true, state:"verifying", mediaId:id });
+    }
+
+    void verifyPreparedBucketMedia(id).catch(err => {
+      console.error(JSON.stringify({
+        event:"prepared_verification_background_failed",
+        mediaId:id,
+        error:sanitizeLog(err?.message || err)
+      }));
+    });
+
+    res.status(202).json({ ok:true, state:"verifying", mediaId:id });
   } catch (err) {
     const msg = sanitizeLog(err?.message || err);
     res.status(msg.includes("NoSuchKey") ? 404 : 422).json({ error:msg });
@@ -2844,7 +2892,9 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error:"internal_error" });
 });
 
-const server = app.listen(PORT, "0.0.0.0", () => {
+const server = await readBucketMediaState();
+
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Stream Harbor backend listening on ${PORT}`);
   if (bucketConfigured()) {
     const origin = process.env.RAILWAY_PUBLIC_DOMAIN

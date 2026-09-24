@@ -2629,6 +2629,87 @@ app.get("/api/bucket/media/:id", requireOwner, async (req, res) => {
   res.json(publicBucketMedia(item));
 });
 
+app.get("/api/media/:id/cache-status", requireOwner, async (req, res) => {
+  try {
+    const id = path.basename(String(req.params.id || ""));
+    const item = await getBucketMedia(id);
+    if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+
+    const effectiveKey = item.preparedKey || item.key;
+    const effectiveSize = Number(item.preparedSize || item.size || 0);
+    const cachePath = streamCacheKeyPath(id, effectiveKey);
+
+    if (streamCacheJobs.has(cachePath)) {
+      return res.json({ state:"caching", mediaId:id });
+    }
+
+    try {
+      const st = await fs.stat(cachePath);
+      if (!effectiveSize || Number(st.size) === effectiveSize) {
+        return res.json({
+          state:"cached",
+          mediaId:id,
+          size:st.size
+        });
+      }
+    } catch {}
+
+    res.json({ state:"not_cached", mediaId:id });
+  } catch (err) {
+    res.status(422).json({ error:sanitizeLog(err?.message || err) });
+  }
+});
+
+app.post("/api/media/:id/cache", requireOwner, async (req, res) => {
+  try {
+    const id = path.basename(String(req.params.id || ""));
+    const item = await getBucketMedia(id);
+    if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+
+    const effectiveKey = item.preparedKey || item.key;
+    const effectiveProfile = item.preparedProfile || item.profile;
+    const effectiveSize = Number(item.preparedSize || item.size || 0);
+
+    if (item.status !== "READY_DIRECT" || !effectiveProfile?.streamReady || effectiveProfile.mode !== "copy") {
+      return res.status(409).json({ error:"media_not_ready_direct" });
+    }
+
+    const cachePath = streamCacheKeyPath(id, effectiveKey);
+    if (streamCacheJobs.has(cachePath)) {
+      return res.status(202).json({ ok:true, state:"caching", mediaId:id });
+    }
+
+    try {
+      const st = await fs.stat(cachePath);
+      if (!effectiveSize || Number(st.size) === effectiveSize) {
+        return res.json({ ok:true, state:"cached", mediaId:id, size:st.size });
+      }
+    } catch {}
+
+    void ensureBucketStreamCache(
+      id,
+      effectiveKey,
+      effectiveSize,
+      item.originalName || id
+    ).catch(err => {
+      const message = sanitizeLog(err?.message || err);
+      console.error(JSON.stringify({
+        event:"stream_precache_failed",
+        mediaId:id,
+        error:message
+      }));
+      void notifyTelegram(`🚨 Stream Harbor
+Предварительное кэширование не удалось
+Файл: ${item.originalName || id}
+Ошибка: ${message}`);
+    });
+
+    res.status(202).json({ ok:true, state:"caching", mediaId:id });
+  } catch (err) {
+    res.status(422).json({ error:sanitizeLog(err?.message || err) });
+  }
+});
+
 app.post("/api/media", requireOwner, upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error:"file_required" });
 

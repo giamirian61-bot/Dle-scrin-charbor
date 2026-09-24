@@ -114,7 +114,7 @@ function storageCard(m){
   const target=m.recommendedVideoBitrate;
 
   let action;
-  if(ready) action='<button class="btn secondary" disabled>READY</button>';
+  if(ready) action='<button class="btn secondary" disabled>READY</button><button class="btn primary cacheMediaBtn">Pre-cache</button>';
   else if(preparing) action='<button class="btn primary" disabled>Preparing…</button>';
   else if(verifying) action='<button class="btn secondary" disabled>Verifying…</button>';
   else if(verifyFailed) action='<button class="btn primary verifyPreparedBtn">Retry verification</button>';
@@ -162,6 +162,41 @@ function renderStorage(){
     }catch(e){
       toast(e.message,true);
       await refreshStorageOnly();
+    }
+  }));
+
+  document.querySelectorAll(".cacheMediaBtn").forEach(b=>b.addEventListener("click",async()=>{
+    const id=b.closest(".storage-card").dataset.id;
+    try{
+      b.disabled=true;
+      b.textContent="Caching…";
+      const started=await api("/api/media/"+encodeURIComponent(id)+"/cache",{method:"POST",body:"{}"});
+      if(started.state==="cached"){
+        b.textContent="Cached";
+        toast("Video already cached locally");
+        return;
+      }
+
+      toast("Pre-caching started");
+      const deadline=Date.now()+30*60*1000;
+      while(Date.now()<deadline){
+        await new Promise(r=>setTimeout(r,2000));
+        const st=await api("/api/media/"+encodeURIComponent(id)+"/cache-status");
+        if(st.state==="cached"){
+          b.textContent="Cached";
+          toast("Video cached and ready for instant start");
+          return;
+        }
+        if(st.state==="not_cached" && Date.now()+5000>deadline) break;
+      }
+
+      b.disabled=false;
+      b.textContent="Pre-cache";
+      toast("Caching is still not complete",true);
+    }catch(e){
+      b.disabled=false;
+      b.textContent="Pre-cache";
+      toast(e.message,true);
     }
   }));
 

@@ -31,6 +31,16 @@ const ffmpeg = spawn("ffmpeg", args, {
 
 process.send?.({ type:"started", slotId, pid:ffmpeg.pid });
 
+const heartbeatTimer = setInterval(() => {
+  process.send?.({
+    type:"heartbeat",
+    slotId,
+    ts:Date.now(),
+    ffmpegPid:ffmpeg.pid
+  });
+}, 5000);
+heartbeatTimer.unref();
+
 let buffer = "";
 const metrics = { fps:null, bitrate:null, outTime:null, speed:null, progress:null };
 
@@ -77,11 +87,13 @@ process.on("SIGTERM", stop);
 process.on("SIGINT", stop);
 
 ffmpeg.on("exit", (code, signal) => {
+  clearInterval(heartbeatTimer);
   process.send?.({ type:"exit", slotId, code, signal, intentional:stopping });
   process.exit(stopping ? 0 : (code || 1));
 });
 
 ffmpeg.on("error", err => {
+  clearInterval(heartbeatTimer);
   process.send?.({ type:"fatal", slotId, error:String(err?.message || err) });
   process.exit(1);
 });

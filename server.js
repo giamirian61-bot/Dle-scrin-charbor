@@ -3872,6 +3872,7 @@ app.use((err, _req, res, _next) => {
 });
 
 await readBucketMediaState();
+await readStreamConfigs();
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Stream Harbor backend listening on ${PORT}`);

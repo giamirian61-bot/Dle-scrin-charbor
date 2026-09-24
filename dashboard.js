@@ -77,7 +77,12 @@ function streamCard(s){
       ):"No video selected"}</div>
     </div>
 
-    <div class="status-line">Worker: ${esc(runtime.state||"idle")} ${runtime.metrics?.bitrate?"· "+esc(runtime.metrics.bitrate):""} ${runtime.lastError?"· "+esc(runtime.lastError):""}</div>
+    <div class="status-line">Worker: ${esc(runtime.state||"idle")}
+      ${runtime.health?.state?"· Health: "+esc(runtime.health.state):""}
+      ${runtime.sourceKind?"· Source: "+esc(runtime.sourceKind):""}
+      ${runtime.metrics?.bitrate?"· "+esc(runtime.metrics.bitrate):""}
+      ${runtime.metrics?.speed?"· "+esc(runtime.metrics.speed):""}
+      ${runtime.lastError?"· "+esc(runtime.lastError):""}</div>
 
     <div class="actions">
       <button class="btn secondary saveBtn">Save</button>

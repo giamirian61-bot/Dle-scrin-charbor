@@ -4,7 +4,8 @@ const state={
   view:"streams",
   cacheStatus:{},
   slotCount:8,
-  activeUpload:null
+  activeUpload:null,
+  events:[]
 };
 
 function q(s){return document.querySelector(s)}
@@ -101,8 +102,10 @@ function setView(view){
   state.view=view;
   q("#streamsView").classList.toggle("hidden",view!=="streams");
   q("#storageView").classList.toggle("hidden",view!=="storage");
-  q("#pageTitle").textContent=view==="streams"?"My streams":"Storage";
+  q("#eventsView").classList.toggle("hidden",view!=="events");
+  q("#pageTitle").textContent=view==="streams"?"My streams":view==="storage"?"Storage":"Events";
   document.querySelectorAll(".nav-item").forEach(b=>b.classList.toggle("active",b.dataset.view===view));
+  if(view==="events") loadEvents().catch(()=>{});
 }
 
 function mediaOptions(selected){
@@ -714,6 +717,46 @@ async function refreshRuntime(){
   }
 }
 
+function eventLabel(type){
+  const map={
+    server_start:"SERVER START",
+    stream_start:"START",
+    stream_stop:"STOP",
+    stream_restore:"RESTORE",
+    worker_exit:"WORKER EXIT",
+    stream_health_restart:"HEALTH RESTART"
+  };
+  return map[type]||String(type||"EVENT").replaceAll("_"," ").toUpperCase();
+}
+function eventClass(type){
+  if(["worker_exit","stream_health_restart"].includes(type)) return "error";
+  if(["stream_restore"].includes(type)) return "warning";
+  if(["stream_start","server_start"].includes(type)) return "ok";
+  return "";
+}
+function renderEvents(){
+  const el=q("#eventsList");
+  if(!el) return;
+  el.innerHTML=state.events.length?state.events.map(e=>{
+    const details=Object.entries(e)
+      .filter(([k])=>!["ts","type"].includes(k))
+      .map(([k,v])=>k+": "+(v==null?"-":typeof v==="object"?JSON.stringify(v):String(v)))
+      .join(" · ");
+    return `<article class="event-row">
+      <div class="event-time">${esc(e.ts?new Date(e.ts).toLocaleString():"-")}</div>
+      <div class="event-main">
+        <span class="event-badge ${esc(eventClass(e.type))}">${esc(eventLabel(e.type))}</span>
+        <div class="event-details">${esc(details||"")}</div>
+      </div>
+    </article>`;
+  }).join(""):'<div class="empty">Пока событий нет.</div>';
+}
+async function loadEvents(){
+  const r=await api("/api/events?limit=200",{cache:"no-store"});
+  state.events=r.items||[];
+  renderEvents();
+}
+
 async function loadAll(){
   try{
     const [s,m,h]=await Promise.all([
@@ -761,6 +804,7 @@ q("#addStreamBtn").addEventListener("click",async()=>{
 
 q("#refreshBtn").addEventListener("click",()=>loadAll());
 q("#refreshStorageBtn").addEventListener("click",()=>refreshStorageOnly());
+q("#refreshEventsBtn").addEventListener("click",()=>loadEvents().catch(e=>toast(e.message,true)));
 
 q("#stopAllBtn").addEventListener("click",async()=>{
   if(!confirm("STOP ALL active streams?")) return;
@@ -987,3 +1031,8 @@ setInterval(()=>{
     refreshStorageOnly().catch(()=>{});
   }
 },15000);
+setInterval(()=>{
+  if(!q("#eventsView").classList.contains("hidden")){
+    loadEvents().catch(()=>{});
+  }
+},10000);

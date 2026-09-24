@@ -986,4 +986,4 @@ setInterval(()=>{
   if(!q("#storageView").classList.contains("hidden")){
     refreshStorageOnly().catch(()=>{});
   }
-},5000);
+},15000);

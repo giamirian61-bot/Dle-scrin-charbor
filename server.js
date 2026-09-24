@@ -65,7 +65,7 @@ try {
 } catch {}
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-const BITRATE_POLICY_VERSION = 2;
+const BITRATE_POLICY_VERSION = 3;
 const MAX_FILE_BYTES = Number(process.env.MAX_FILE_BYTES || 400 * 1024 * 1024);
 const MAX_BUCKET_FILE_BYTES = Number(process.env.MAX_BUCKET_FILE_BYTES || 8 * 1024 * 1024 * 1024);
 const MULTIPART_PART_BYTES = 64 * 1024 * 1024;
@@ -343,12 +343,17 @@ function summarizeProbe(probe) {
       height:video.height,
       pixFmt:video.pix_fmt,
       frameRate:video.avg_frame_rate,
+      realFrameRate:video.r_frame_rate || null,
+      duration:video.duration || null,
+      startTime:video.start_time || null,
       bitRate:video.bit_rate || null
     } : null,
     audio:audio ? {
       codec:audio.codec_name,
       sampleRate:audio.sample_rate,
       channels:audio.channels,
+      duration:audio.duration || null,
+      startTime:audio.start_time || null,
       bitRate:audio.bit_rate || null
     } : null
   };
@@ -452,6 +457,7 @@ function chooseProfile(summary) {
   };
 
   const fps = parseFps(v.frameRate);
+  const nominalFps = parseFps(v.realFrameRate || "");
   const keyframeGap = summary.keyframes?.maxKeyframeGap;
   const bitratePolicy = adaptiveBitrateProfile(summary);
 
@@ -460,6 +466,25 @@ function chooseProfile(summary) {
     v.pixFmt === "yuv420p" &&
     fps > 0 && fps <= 60 &&
     (!a || a.codec === "aac");
+
+  const timingKnown = Boolean(v.frameRate && v.realFrameRate);
+  const cfrReady =
+    timingKnown &&
+    nominalFps > 0 &&
+    Math.abs(fps - nominalFps) <= Math.max(0.02, nominalFps * 0.002);
+
+  const videoDuration = Number(v.duration || summary.duration || 0);
+  const audioDuration = Number(a?.duration || 0);
+  const avDurationTolerance = Math.max(0.12, fps > 0 ? 3 / fps : 0.12);
+  const avDurationReady =
+    !a ||
+    (
+      videoDuration > 0 &&
+      audioDuration > 0 &&
+      Math.abs(videoDuration - audioDuration) <= avDurationTolerance
+    );
+
+  const loopTimingReady = cfrReady && avDurationReady;
 
   const gopReady =
     Number.isFinite(keyframeGap) &&
@@ -472,7 +497,7 @@ function chooseProfile(summary) {
     !sourceKbps ||
     sourceKbps <= bitratePolicy.youtubeCeilingKbps * 1.10;
 
-  if (codecReady && gopReady && bitrateReady) {
+  if (codecReady && loopTimingReady && gopReady && bitrateReady) {
     return {
       streamReady:true,
       mode:"copy",
@@ -488,11 +513,16 @@ function chooseProfile(summary) {
     mode:"prepare",
     reason:
       !codecReady ? "codec_normalization_required" :
+      !loopTimingReady ? "loop_timing_normalization_required" :
       !gopReady ? "keyframe_interval_too_long" :
       "bitrate_above_youtube_ceiling",
     targetVideoBitrate:bitratePolicy.recommendedVideoBitrate,
     recommendedVideoBitrate:bitratePolicy.recommendedVideoBitrate,
     detectedMaxKeyframeGap:keyframeGap,
+    detectedAverageFps:fps || null,
+    detectedNominalFps:nominalFps || null,
+    detectedVideoDuration:videoDuration || null,
+    detectedAudioDuration:audioDuration || null,
     bitratePolicy
   };
 }
@@ -848,12 +878,28 @@ async function removeBucketMedia(id) {
 
 function publicBucketMedia(item) {
   const profile = item?.profile || null;
+  const transientStatuses = new Set([
+    "UPLOADING","STALLED","UPLOAD_PAUSED","PREPARING","PREPARE_QUEUED",
+    "PREPARE_FAILED","VERIFYING","VERIFY_FAILED","ERROR"
+  ]);
+  const preparedProfileNow = item?.preparedProbe ? chooseProfile(item.preparedProbe) : null;
+  const sourceProfileNow = item?.probe ? chooseProfile(item.probe) : null;
+  const effectiveStatus = transientStatuses.has(item?.status)
+    ? item.status
+    : item?.preparedKey
+      ? (
+          Number(item?.bitratePolicyVersion || 0) < BITRATE_POLICY_VERSION ||
+          !preparedProfileNow?.streamReady
+            ? "OPTIMIZE_NEEDED"
+            : "READY_DIRECT"
+        )
+      : (sourceProfileNow?.streamReady ? "READY_DIRECT" : "PREPARE_NEEDED");
   return {
     id:item.id,
     sourceType:"bucket",
     size:item.size || null,
     originalName:item.originalName || item.id,
-    status:item.status || "UNKNOWN",
+    status:effectiveStatus,
     probe:item.probe || null,
     profile,
     preparedId:item.preparedKey || null,
@@ -868,7 +914,7 @@ function publicBucketMedia(item) {
     verificationStartedAt:item.verificationStartedAt || null,
     verifiedAt:item.verifiedAt || null,
     verificationError:item.verificationError ? sanitizeLog(item.verificationError) : null,
-    bitratePolicyVersion:item.bitratePolicyVersion || BITRATE_POLICY_VERSION,
+    bitratePolicyVersion:Number(item.bitratePolicyVersion || 0),
     recommendedVideoBitrate:profile?.recommendedVideoBitrate || profile?.bitratePolicy?.recommendedVideoBitrate || null,
     sourceVideoBitrate:profile?.bitratePolicy?.sourceVideoBitrate || null,
     prepareError:item.prepareError || null,
@@ -1319,7 +1365,7 @@ async function resolveStreamSource(mediaId) {
   if (bucketItem) {
     const effectiveKey = bucketItem.preparedKey || bucketItem.key;
     const effectiveProbe = bucketItem.preparedProbe || bucketItem.probe;
-    const effectiveProfile = bucketItem.preparedProfile || bucketItem.profile;
+    const effectiveProfile = chooseProfile(effectiveProbe || {});
     const effectiveSize = Number(bucketItem.preparedSize || bucketItem.size || 0);
     if (bucketItem.status !== "READY_DIRECT" || !effectiveProfile?.streamReady || effectiveProfile.mode !== "copy") {
       throw new Error("media_requires_preparation");
@@ -1379,6 +1425,7 @@ async function resolveStreamSource(mediaId) {
     } catch {}
   }
 
+  profile = chooseProfile(streamProbe || {});
   if (!profile?.streamReady || profile.mode !== "copy") {
     throw new Error("media_requires_preparation");
   }
@@ -1943,7 +1990,7 @@ async function prepareBucketMedia(mediaId) {
   let item = await getBucketMedia(id);
   if (!item) throw new Error("bucket_media_not_found");
 
-  const sourceProfile = item.profile || chooseProfile(item.probe || {});
+  const sourceProfile = chooseProfile(item.probe || {});
   if (sourceProfile.streamReady) {
     item = {
       ...item,
@@ -1969,17 +2016,21 @@ async function prepareBucketMedia(mediaId) {
     "-preset","veryfast",
     "-threads","1",
     "-x264-params","threads=1:lookahead_threads=1:sync-lookahead=0:rc-lookahead=0",
-    "-pix_fmt","yuv420p",
-    "-r","30",
+    "-vf","fps=30,format=yuv420p,setpts=N/(30*TB)",
+    "-fps_mode:v","cfr",
     "-g","60",
     "-keyint_min","60",
     "-sc_threshold","0",
     "-b:v",`${kbps}k`,
     "-maxrate",`${kbps}k`,
     "-bufsize",`${kbps * 2}k`,
-    "-c:a","aac",
-    "-b:a","128k",
-    "-ar","48000",
+    ...(item.probe?.audio ? [
+      "-c:a","aac",
+      "-b:a","128k",
+      "-ar","48000",
+      "-af","aresample=48000:async=1:first_pts=0,apad",
+      "-shortest"
+    ] : []),
     "-movflags","+frag_keyframe+empty_moov+default_base_moof",
     "-f","mp4",
     "-progress","pipe:2",
@@ -2256,17 +2307,21 @@ async function prepareMedia(mediaId) {
     "-preset","veryfast",
     "-threads","2",
     "-x264-params","threads=2:lookahead_threads=1:sync-lookahead=0:rc-lookahead=10",
-    "-pix_fmt","yuv420p",
-    "-r","30",
+    "-vf","fps=30,format=yuv420p,setpts=N/(30*TB)",
+    "-fps_mode:v","cfr",
     "-g","60",
     "-keyint_min","60",
     "-sc_threshold","0",
     "-b:v",`${kbps}k`,
     "-maxrate",`${kbps}k`,
     "-bufsize",`${kbps * 2}k`,
-    "-c:a","aac",
-    "-b:a","128k",
-    "-ar","48000",
+    ...(sourceAnalysis.audio ? [
+      "-c:a","aac",
+      "-b:a","128k",
+      "-ar","48000",
+      "-af","aresample=48000:async=1:first_pts=0,apad",
+      "-shortest"
+    ] : []),
     "-movflags","+faststart",
     "-progress","pipe:2",
     "-nostats",

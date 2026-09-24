@@ -124,6 +124,8 @@ function sanitizeLog(value) {
     ...SLOT_IDS.map(id => process.env[`YOUTUBE_STREAM_KEY_${id}`] || "")
   ].filter(Boolean));
   for (const secret of secrets) s = s.split(secret).join("[REDACTED]");
+  // Never persist temporary signed URLs or query credentials in logs/state/Telegram.
+  s = s.replace(/(https?:\/\/[^\s?]+)\?[^\s]*/gi, "$1?[REDACTED_QUERY]");
   return s;
 }
 
@@ -192,14 +194,14 @@ const upload = multer({
   limits: { fileSize: MAX_FILE_BYTES, files: 1 }
 });
 
-async function probeFile(filePath) {
+async function probeFile(filePath, timeoutMs=60_000) {
   const { stdout } = await execFileAsync("ffprobe", [
     "-v","error",
     "-show_format",
     "-show_streams",
     "-of","json",
     filePath
-  ], { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 });
+  ], { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 });
   return JSON.parse(stdout);
 }
 
@@ -776,7 +778,7 @@ async function probeRemoteKeyframes(input) {
 }
 
 async function analyzeRemoteMedia(input, knownSize) {
-  const probe = await probeFile(input);
+  const probe = await probeFile(input, 900_000);
   const summary = summarizeProbe(probe);
   const durationSec = Number(summary.duration || 0);
   summary.fileSize = Number(knownSize || 0) || null;
@@ -1189,6 +1191,101 @@ function ffmpegTimeToSeconds(value) {
   return Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
 }
 
+async function verifyPreparedBucketMedia(mediaId) {
+  const id = path.basename(String(mediaId || ""));
+  if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
+
+  let item = await getBucketMedia(id);
+  if (!item) throw new Error("bucket_media_not_found");
+  if (!item.preparedKey) throw new Error("prepared_object_missing");
+
+  const head = await headBucketObject(item.preparedKey);
+  if (!head.size) throw new Error("prepared_bucket_object_empty");
+
+  item = {
+    ...item,
+    status:"VERIFYING",
+    preparedSize:head.size,
+    prepareUploadId:null,
+    prepareProgressPct:100,
+    verificationStartedAt:new Date().toISOString(),
+    verificationError:null,
+    prepareError:null,
+    updatedAt:new Date().toISOString()
+  };
+  await upsertBucketMedia(item);
+
+  let lastErr = null;
+  for (let attempt=1; attempt<=3; attempt++) {
+    try {
+      const preparedUrl = await createBucketReadUrl(item.preparedKey, 21600);
+      const preparedProbe = await analyzeRemoteMedia(preparedUrl, head.size);
+      const preparedProfile = chooseProfile(preparedProbe);
+      if (!preparedProfile.streamReady) {
+        throw new Error("prepared_file_not_stream_ready");
+      }
+
+      const completed = await getBucketMedia(id) || item;
+      const verifiedAt = new Date().toISOString();
+      await upsertBucketMedia({
+        ...completed,
+        status:"READY_DIRECT",
+        preparedSize:head.size,
+        preparedProbe,
+        preparedProfile,
+        bitratePolicyVersion:BITRATE_POLICY_VERSION,
+        prepareProgressPct:100,
+        preparedUploadedBytes:head.size,
+        preparedAt:completed.preparedAt || verifiedAt,
+        verifiedAt,
+        verificationError:null,
+        prepareError:null,
+        updatedAt:verifiedAt
+      });
+
+      void notifyTelegram(`✅ Stream Harbor
+Видео проверено и готово к эфиру
+Файл: ${completed.originalName || id}
+Размер готовой версии: ${(head.size/1024/1024).toFixed(1)} MB`);
+
+      return {
+        state:"ready",
+        mediaId:id,
+        preparedSize:head.size,
+        profile:preparedProfile
+      };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < 3) await new Promise(r => setTimeout(r, 10_000 * attempt));
+    }
+  }
+
+  const message = sanitizeLog(lastErr?.message || lastErr || "verification_failed");
+  const failed = await getBucketMedia(id) || item;
+  await upsertBucketMedia({
+    ...failed,
+    status:"VERIFY_FAILED",
+    preparedSize:head.size,
+    prepareUploadId:null,
+    prepareProgressPct:100,
+    verificationError:message,
+    prepareError:message,
+    updatedAt:new Date().toISOString()
+  });
+
+  void notifyTelegram(`⚠️ Stream Harbor
+Готовый файл сохранён, но финальная проверка не прошла
+Файл: ${failed.originalName || id}
+Перекодирование повторять не нужно. Можно повторить только проверку.
+Ошибка: ${message}`);
+
+  return {
+    state:"verify_failed",
+    mediaId:id,
+    error:message
+  };
+}
+
 async function prepareBucketMedia(mediaId) {
   if (activeSlots.size > 0) throw new Error("cannot_prepare_while_streaming");
 
@@ -1381,51 +1478,59 @@ async function prepareBucketMedia(mediaId) {
       const head = await headBucketObject(preparedKey);
       if (!head.size) throw new Error("prepared_bucket_object_empty");
 
-      const preparedUrl = await createBucketReadUrl(preparedKey, 21600);
-      const preparedProbe = await analyzeRemoteMedia(preparedUrl, head.size);
-      const preparedProfile = chooseProfile(preparedProbe);
-      if (!preparedProfile.streamReady) {
-        throw new Error("prepared_file_not_stream_ready");
-      }
-
+      const finalizedAt = new Date().toISOString();
       const completed = await getBucketMedia(id) || item;
       await upsertBucketMedia({
         ...completed,
-        status:"READY_DIRECT",
+        status:"VERIFYING",
         preparedKey,
         prepareUploadId:null,
         preparedSize:head.size,
-        preparedProbe,
-        preparedProfile,
         preparedTargetVideoBitrate:kbps,
-        bitratePolicyVersion:BITRATE_POLICY_VERSION,
         prepareProgressPct:100,
         preparedUploadedBytes:head.size,
-        preparedAt:new Date().toISOString(),
+        preparedAt:finalizedAt,
         prepareError:null,
-        updatedAt:new Date().toISOString()
+        updatedAt:finalizedAt
       });
 
-      void notifyTelegram(`✅ Stream Harbor
-Видео подготовлено и готово к эфиру
-Файл: ${completed.originalName || id}
-Размер готовой версии: ${(head.size/1024/1024).toFixed(1)} MB`);
+      // Verification is intentionally separate from transcoding. If it fails,
+      // the multi-hour prepared object stays in Bucket and can be re-verified.
+      await verifyPreparedBucketMedia(id);
     } catch (err) {
       try { child.kill("SIGTERM"); } catch {}
-      await abortMultipartUpload({ key:preparedKey, uploadId }).catch(() => {});
-      await deleteBucketObject(preparedKey).catch(() => {});
+
+      const current = await getBucketMedia(id);
+      const alreadyFinalized = Boolean(
+        current?.preparedKey === preparedKey &&
+        current?.preparedSize &&
+        !current?.prepareUploadId &&
+        ["VERIFYING","VERIFY_FAILED","READY_DIRECT"].includes(current?.status)
+      );
+
+      if (!alreadyFinalized) {
+        await abortMultipartUpload({ key:preparedKey, uploadId }).catch(() => {});
+        await deleteBucketObject(preparedKey).catch(() => {});
+      }
 
       const message = sanitizeLog(err?.message || err);
       const failed = await getBucketMedia(id) || item;
       await upsertBucketMedia({
         ...failed,
-        status:"PREPARE_FAILED",
+        status:alreadyFinalized ? "VERIFY_FAILED" : "PREPARE_FAILED",
         prepareUploadId:null,
         prepareError:message,
+        ...(alreadyFinalized ? { verificationError:message } : {}),
         updatedAt:new Date().toISOString()
       }).catch(() => {});
 
-      void notifyTelegram(`🚨 Stream Harbor
+      void notifyTelegram(alreadyFinalized
+        ? `⚠️ Stream Harbor
+Подготовленный файл сохранён, но проверка не завершилась
+Файл: ${failed.originalName || id}
+Повторное перекодирование не требуется.
+Ошибка: ${message}`
+        : `🚨 Stream Harbor
 Подготовка видео не удалась
 Файл: ${failed.originalName || id}
 Ошибка: ${message}`);
@@ -2167,6 +2272,20 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
   await fs.unlink(path.join(MEDIA_DIR, id + ".meta.json")).catch(() => {});
 
   res.json({ ok:true });
+});
+
+app.post("/api/media/:id/verify-prepared", requireOwner, async (req, res) => {
+  try {
+    const id = path.basename(String(req.params.id || ""));
+    const item = await getBucketMedia(id);
+    if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+    if (!item.preparedKey) return res.status(409).json({ error:"prepared_object_missing" });
+    const result = await verifyPreparedBucketMedia(id);
+    res.json({ ok:result.state === "ready", ...result });
+  } catch (err) {
+    const msg = sanitizeLog(err?.message || err);
+    res.status(msg.includes("NoSuchKey") ? 404 : 422).json({ error:msg });
+  }
 });
 
 app.post("/api/media/:id/prepare", requireOwner, async (req, res) => {

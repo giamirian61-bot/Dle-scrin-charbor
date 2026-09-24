@@ -41,3 +41,8 @@ jobs:
         run: |
           node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['const BITRATE_POLICY_VERSION = 3;','realFrameRate:video.r_frame_rate','loop_timing_normalization_required','fps=30,format=yuv420p,setpts=N/(30*TB)','aresample=48000:async=1:first_pts=0,apad','\"-shortest\"']) if(!s.includes(needle)) throw new Error('missing loop stability contract: '+needle);"
           node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('const sourceProfile = chooseProfile(item.probe || {});')) throw new Error('bucket preparation still trusts stale profile');"
+
+      - name: Verify preparation speed and recovery contract
+        run: |
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['const PREPARE_THREADS = Math.min(4, Math.max(1, Number(process.env.PREPARE_THREADS || 2) || 2));','recoverInterruptedBucketPreparation','prepare_state_recovered','\"-threads\",String(PREPARE_THREADS)']) if(!s.includes(needle)) throw new Error('missing preparation contract: '+needle);"
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('status:\"PREPARE_NEEDED\"')) throw new Error('interrupted preparation is not reset');"

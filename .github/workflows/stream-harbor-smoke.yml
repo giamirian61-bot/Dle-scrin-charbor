@@ -40,7 +40,7 @@ jobs:
       - name: Verify loop-safe media normalization
         run: |
           node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['const BITRATE_POLICY_VERSION = 3;','realFrameRate:video.r_frame_rate','loop_timing_normalization_required','fps=30,format=yuv420p,setpts=N/(30*TB)','aresample=48000:async=1:first_pts=0,apad','\"-shortest\"']) if(!s.includes(needle)) throw new Error('missing loop stability contract: '+needle);"
-          node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('const sourceProfile = chooseProfile(item.probe || {});')) throw new Error('bucket preparation still trusts stale profile');"
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('sourceProfile = chooseProfile(sourceProbe);')) throw new Error('bucket preparation does not re-evaluate the current source probe');"
 
       - name: Verify preparation speed and recovery contract
         run: |

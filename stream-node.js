@@ -150,12 +150,25 @@ function stopSlot(slotId, intentional=true) {
   setTimeout(()=>{ try { current.worker.kill("SIGKILL"); } catch {} },8000).unref();
 }
 
+async function waitForSlotStopped(slotId, timeoutMs=12_000) {
+  const id=String(slotId);
+  const deadline=Date.now()+Math.max(1000,Number(timeoutMs||0));
+  while(active.has(id) && Date.now()<deadline){
+    await new Promise(resolve=>setTimeout(resolve,200));
+  }
+  return !active.has(id);
+}
+
 async function startSlot(spec) {
   const slotId=String(spec.slotId);
   const mediaPath=await ensureMediaCached(spec.media);
 
   const current=active.get(slotId);
-  if(current) stopSlot(slotId,true);
+  if(current){
+    stopSlot(slotId,true);
+    const stopped=await waitForSlotStopped(slotId,12_000);
+    if(!stopped) throw new Error("previous_worker_stop_timeout");
+  }
 
   const target=String(spec.rtmpUrl || "").replace(/\/+$/,"")+"/"+String(spec.streamKey || "");
   if(!/^rtmps?:\/\//i.test(target)) throw new Error("invalid_rtmp_target");

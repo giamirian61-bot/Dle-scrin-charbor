@@ -3833,6 +3833,19 @@ await readBucketMediaState();
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Stream Harbor backend listening on ${PORT}`);
+  console.log(JSON.stringify({
+    event:"server_config",
+    slotCount:STREAM_SLOT_COUNT,
+    executionMode:STREAM_EXECUTION_MODE,
+    features:{
+      restart:true,
+      cacheClear:true,
+      uploadPause:true,
+      uploadCancel:true,
+      healthMonitor:true,
+      preCache:true
+    }
+  }));
   streamCacheDiskInfo()
     .then(info => console.log(JSON.stringify({
       event:"stream_cache_storage",

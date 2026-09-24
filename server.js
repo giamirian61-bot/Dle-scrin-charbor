@@ -904,6 +904,47 @@ async function recoverInterruptedBucketPreparation() {
   return recoveredIds;
 }
 
+function chooseEffectiveBucketVariant(item) {
+  const sourceProfile = item?.probe ? chooseProfile(item.probe) : null;
+  const preparedProfile = item?.preparedProbe ? chooseProfile(item.preparedProbe) : null;
+
+  if (sourceProfile?.streamReady && sourceProfile.mode === "copy") {
+    return {
+      kind:"source",
+      key:item?.key || null,
+      probe:item?.probe || null,
+      profile:sourceProfile,
+      size:Number(item?.size || 0),
+      ready:true
+    };
+  }
+
+  if (
+    item?.preparedKey &&
+    Number(item?.bitratePolicyVersion || 0) >= BITRATE_POLICY_VERSION &&
+    preparedProfile?.streamReady &&
+    preparedProfile.mode === "copy"
+  ) {
+    return {
+      kind:"prepared",
+      key:item.preparedKey,
+      probe:item.preparedProbe,
+      profile:preparedProfile,
+      size:Number(item?.preparedSize || item?.size || 0),
+      ready:true
+    };
+  }
+
+  return {
+    kind:null,
+    key:null,
+    probe:null,
+    profile:null,
+    size:0,
+    ready:false
+  };
+}
+
 function publicBucketMedia(item) {
   const profile = item?.profile || null;
   const livePrepareStatus =
@@ -914,19 +955,15 @@ function publicBucketMedia(item) {
     "UPLOADING","STALLED","UPLOAD_PAUSED",
     "PREPARE_FAILED","VERIFYING","VERIFY_FAILED","ERROR"
   ]);
-  const preparedProfileNow = item?.preparedProbe ? chooseProfile(item.preparedProbe) : null;
-  const sourceProfileNow = item?.probe ? chooseProfile(item.probe) : null;
+  const effectiveVariant = chooseEffectiveBucketVariant(item);
   const effectiveStatus = livePrepareStatus || (
     transientStatuses.has(item?.status)
       ? item.status
-      : item?.preparedKey
-      ? (
-          Number(item?.bitratePolicyVersion || 0) < BITRATE_POLICY_VERSION ||
-          !preparedProfileNow?.streamReady
-            ? "OPTIMIZE_NEEDED"
-            : "READY_DIRECT"
-        )
-      : (sourceProfileNow?.streamReady ? "READY_DIRECT" : "PREPARE_NEEDED")
+      : effectiveVariant.ready
+        ? "READY_DIRECT"
+        : item?.preparedKey
+          ? "OPTIMIZE_NEEDED"
+          : "PREPARE_NEEDED"
   );
   return {
     id:item.id,
@@ -1397,11 +1434,12 @@ async function resolveStreamSource(mediaId) {
 
   const bucketItem = await getBucketMedia(id);
   if (bucketItem) {
-    const effectiveKey = bucketItem.preparedKey || bucketItem.key;
-    const effectiveProbe = bucketItem.preparedProbe || bucketItem.probe;
-    const effectiveProfile = chooseProfile(effectiveProbe || {});
-    const effectiveSize = Number(bucketItem.preparedSize || bucketItem.size || 0);
-    if (bucketItem.status !== "READY_DIRECT" || !effectiveProfile?.streamReady || effectiveProfile.mode !== "copy") {
+    const effectiveVariant = chooseEffectiveBucketVariant(bucketItem);
+    const effectiveKey = effectiveVariant.key;
+    const effectiveProbe = effectiveVariant.probe;
+    const effectiveProfile = effectiveVariant.profile;
+    const effectiveSize = effectiveVariant.size;
+    if (!effectiveVariant.ready || !effectiveKey) {
       throw new Error("media_requires_preparation");
     }
 
@@ -2054,6 +2092,9 @@ async function prepareBucketMedia(mediaId) {
       preparedUploadedBytes:0,
       prepareStartedAt:null,
       queuedAt:null,
+      preparedProbe:null,
+      preparedProfile:null,
+      preparedSize:null,
       prepareError:null,
       updatedAt:new Date().toISOString()
     };
@@ -3114,8 +3155,9 @@ app.get("/api/media/:id/cache-status", requireOwner, async (req, res) => {
     const item = await getBucketMedia(id);
     if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
 
-    const effectiveKey = item.preparedKey || item.key;
-    const effectiveSize = Number(item.preparedSize || item.size || 0);
+    const effectiveVariant = chooseEffectiveBucketVariant(item);
+    const effectiveKey = effectiveVariant.key;
+    const effectiveSize = effectiveVariant.size;
     const cachePath = streamCacheKeyPath(id, effectiveKey);
 
     try {
@@ -3176,11 +3218,12 @@ app.post("/api/media/:id/cache", requireOwner, async (req, res) => {
     const item = await getBucketMedia(id);
     if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
 
-    const effectiveKey = item.preparedKey || item.key;
-    const effectiveProfile = item.preparedProfile || item.profile;
-    const effectiveSize = Number(item.preparedSize || item.size || 0);
+    const effectiveVariant = chooseEffectiveBucketVariant(item);
+    const effectiveKey = effectiveVariant.key;
+    const effectiveProfile = effectiveVariant.profile;
+    const effectiveSize = effectiveVariant.size;
 
-    if (item.status !== "READY_DIRECT" || !effectiveProfile?.streamReady || effectiveProfile.mode !== "copy") {
+    if (!effectiveVariant.ready || !effectiveKey) {
       return res.status(409).json({ error:"media_not_ready_direct" });
     }
 
@@ -3226,7 +3269,8 @@ app.delete("/api/media/:id/cache", requireOwner, async (req, res) => {
     const item = await getBucketMedia(id);
     if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
 
-    const effectiveKey = item.preparedKey || item.key;
+    const effectiveVariant = chooseEffectiveBucketVariant(item);
+    const effectiveKey = effectiveVariant.key || item.key;
     const cachePath = streamCacheKeyPath(id, effectiveKey);
 
     if (streamCacheJobs.has(cachePath)) {
@@ -3455,10 +3499,11 @@ app.get("/api/worker-nodes/:nodeId/desired", requireWorkerAgent, async (req, res
     }
 
     const media = await getBucketMedia(desired.mediaId);
-    const effectiveProfile = media?.preparedProfile || media?.profile;
-    const effectiveSize = Number(media?.preparedSize || media?.size || 0);
-    const effectiveKey = media?.preparedKey || media?.key;
-    if (!media || media.status !== "READY_DIRECT" || !effectiveProfile?.streamReady || !effectiveKey) {
+    const effectiveVariant = media ? chooseEffectiveBucketVariant(media) : { ready:false };
+    const effectiveProfile = effectiveVariant.profile;
+    const effectiveSize = effectiveVariant.size;
+    const effectiveKey = effectiveVariant.key;
+    if (!media || !effectiveVariant.ready || !effectiveKey) {
       slots.push({ slotId, desired:"stopped", error:"remote_media_not_ready" });
       continue;
     }
@@ -3507,10 +3552,11 @@ app.get("/api/worker-nodes/:nodeId/media/:mediaId/source", requireWorkerAgent, a
   const media = await getBucketMedia(mediaId);
   if (!media) return res.status(404).json({ error:"bucket_media_not_found" });
 
-  const effectiveKey = media.preparedKey || media.key;
-  const effectiveProfile = media.preparedProfile || media.profile;
-  const effectiveSize = Number(media.preparedSize || media.size || 0);
-  if (media.status !== "READY_DIRECT" || !effectiveProfile?.streamReady || !effectiveKey) {
+  const effectiveVariant = chooseEffectiveBucketVariant(media);
+  const effectiveKey = effectiveVariant.key;
+  const effectiveProfile = effectiveVariant.profile;
+  const effectiveSize = effectiveVariant.size;
+  if (!effectiveVariant.ready || !effectiveKey) {
     return res.status(409).json({ error:"media_not_ready_direct" });
   }
 
@@ -3685,8 +3731,8 @@ app.post("/api/streams/:id/start", requireOwner, async (req, res) => {
 
     if (STREAM_EXECUTION_MODE === "remote") {
       const media = await getBucketMedia(item.mediaId);
-      const effectiveProfile = media?.preparedProfile || media?.profile;
-      if (!media || media.status !== "READY_DIRECT" || !effectiveProfile?.streamReady) {
+      const effectiveVariant = media ? chooseEffectiveBucketVariant(media) : { ready:false };
+      if (!media || !effectiveVariant.ready) {
         return res.status(409).json({ error:"remote_media_not_ready" });
       }
       const nodeId = workerNodeForSlot(slotId);

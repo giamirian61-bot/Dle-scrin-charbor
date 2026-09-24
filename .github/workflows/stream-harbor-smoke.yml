@@ -61,3 +61,9 @@ jobs:
       - name: Verify re-probe before full preparation
         run: |
           node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['sourceProbe = await analyzeRemoteMedia(sourceUrl, item.size || null);','sourceProfile = chooseProfile(sourceProbe);','bitratePolicyVersion:BITRATE_POLICY_VERSION','return { state:\"already_ready\", mediaId:id, profile:sourceProfile };']) if(!s.includes(needle)) throw new Error('missing re-probe contract: '+needle);"
+
+
+      - name: Verify effective bucket source selection
+        run: |
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['function chooseEffectiveBucketVariant(item)','if (sourceProfile?.streamReady && sourceProfile.mode === \"copy\")','kind:\"source\"','const effectiveVariant = chooseEffectiveBucketVariant(bucketItem);','const effectiveVariant = media ? chooseEffectiveBucketVariant(media) : { ready:false };']) if(!s.includes(needle)) throw new Error('missing effective bucket source contract: '+needle);"
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); if(s.includes('const effectiveKey = bucketItem.preparedKey || bucketItem.key;')) throw new Error('resolveStreamSource still prefers stale preparedKey'); if(s.includes('const effectiveProfile = media?.preparedProfile || media?.profile;')) throw new Error('remote start still prefers stale prepared profile');"

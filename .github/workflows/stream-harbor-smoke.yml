@@ -1,0 +1,35 @@
+name: Stream Harbor smoke check
+
+on:
+  push:
+    branches:
+      - dev-live-hardening
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check backend
+        run: node --check server.js
+
+      - name: Syntax check worker
+        run: node --check worker.js
+
+      - name: Syntax check dashboard
+        run: node --check dashboard.js

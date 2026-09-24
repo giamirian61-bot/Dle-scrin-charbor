@@ -1,0 +1,21 @@
+FROM node:22-bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY package.json ./
+COPY worker.js ./
+COPY stream-node.js ./
+
+ENV NODE_ENV=production
+ENV WORKER_CACHE_DIR=/var/lib/stream-harbor-cache
+ENV WORKER_CACHE_QUOTA_BYTES=107374182400
+ENV WORKER_POLL_MS=3000
+ENV WORKER_STATUS_MS=5000
+
+RUN mkdir -p /var/lib/stream-harbor-cache
+
+CMD ["node","stream-node.js"]

@@ -1429,7 +1429,7 @@ async function ensureBucketStreamCache(mediaId, objectKey, expectedSize, origina
   }
 }
 
-async function resolveStreamSource(mediaId) {
+async function resolveStreamSource(mediaId, { preferRemoteRecovery=false } = {}) {
   const id = path.basename(String(mediaId || ""));
   if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
 
@@ -1442,6 +1442,38 @@ async function resolveStreamSource(mediaId) {
     const effectiveSize = effectiveVariant.size;
     if (!effectiveVariant.ready || !effectiveKey) {
       throw new Error("media_requires_preparation");
+    }
+
+    if (preferRemoteRecovery) {
+      const cachePath = streamCacheKeyPath(id, effectiveKey);
+      try {
+        const st = await fs.stat(cachePath);
+        if (!effectiveSize || Number(st.size) === Number(effectiveSize)) {
+          await fs.utimes(cachePath, new Date(), new Date()).catch(() => {});
+          return {
+            id,
+            streamPath:cachePath,
+            streamProbe:effectiveProbe,
+            profile:effectiveProfile,
+            sourceKind:"local_cache",
+            cacheHit:true
+          };
+        }
+      } catch {}
+
+      const recoveryUrl = await createBucketReadUrl(effectiveKey, 21600);
+      void logEvent("stream_remote_recovery_source", {
+        mediaId:id,
+        sourceKind:"bucket_recovery"
+      });
+      return {
+        id,
+        streamPath:recoveryUrl,
+        streamProbe:effectiveProbe,
+        profile:effectiveProfile,
+        sourceKind:"bucket_recovery",
+        cacheHit:false
+      };
     }
 
     const cached = await ensureBucketStreamCache(
@@ -1581,7 +1613,7 @@ async function startStreamInternalUnlocked(slotId, mediaId, { restore=false, ret
   const effectiveStreamKey = streamKey || streamKeyForSlot(id);
   if (!effectiveStreamKey) throw new Error("slot_stream_key_not_configured");
 
-  const source = await resolveStreamSource(mediaId);
+  const source = await resolveStreamSource(mediaId, { preferRemoteRecovery:Boolean(restore) });
   const sourceMeta = (await getBucketMedia(source.id)) || await readMeta(source.id).catch(() => null);
   const sourceName = sourceMeta?.originalName || source.id;
   const baseUrl = String(rtmpUrl || YOUTUBE_RTMPS_BASE).replace(/\/+$/, "");

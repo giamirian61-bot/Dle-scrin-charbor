@@ -101,6 +101,8 @@ function storageCard(m){
   const ready=m.status==="READY_DIRECT";
   const optimize=m.status==="OPTIMIZE_NEEDED";
   const preparing=m.status==="PREPARING";
+  const verifying=m.status==="VERIFYING";
+  const verifyFailed=m.status==="VERIFY_FAILED";
   const queued=m.status==="PREPARE_QUEUED";
   const bucket=m.sourceType==="bucket";
   const uploading=m.status==="UPLOADING";
@@ -113,6 +115,8 @@ function storageCard(m){
   let action;
   if(ready) action='<button class="btn secondary" disabled>READY</button>';
   else if(preparing) action='<button class="btn primary" disabled>Preparing…</button>';
+  else if(verifying) action='<button class="btn secondary" disabled>Verifying…</button>';
+  else if(verifyFailed) action='<button class="btn primary verifyPreparedBtn">Retry verification</button>';
   else if(queued) action='<button class="btn secondary" disabled>Queued</button>';
   else if(uploading) action='<button class="btn secondary" disabled>Uploading '+progressPct+'%</button>';
   else if(stalled) action='<button class="btn danger" disabled>UPLOAD STALLED</button>';
@@ -132,10 +136,12 @@ function storageCard(m){
       ${source?'<div>Source video bitrate: '+esc(source)+' Kbps</div>':""}
       ${target?'<div><strong>Auto target: '+esc(target)+' Kbps</strong></div>':""}
       ${preparing?'<div class="upload-progress-label">Preparing '+Math.round(Number(m.prepareProgressPct||0))+'%</div><div class="upload-progress"><span style="width:'+Math.max(0,Math.min(100,Number(m.prepareProgressPct||0)))+'%"></span></div>':""}
+      ${verifying?'<div class="upload-progress-label">Final verification… prepared file is already saved</div>':""}
+      ${verifyFailed&&m.verificationError?'<div class="storage-error">Verification: '+esc(m.verificationError)+'</div>':""}
     </div>
     <div class="storage-actions">
       ${action}
-      <button class="btn danger deleteMediaBtn" ${preparing||queued?'disabled':""}>Delete</button>
+      <button class="btn danger deleteMediaBtn" ${preparing||verifying||queued?'disabled':""}>Delete</button>
     </div>
   </article>`;
 }
@@ -150,6 +156,20 @@ function renderStorage(){
       toast(result.state==="queued" ? "Added to preparation queue" : "Preparation started");
       await refreshStorageOnly();
       pollPrepareQueue();
+    }catch(e){
+      toast(e.message,true);
+      await refreshStorageOnly();
+    }
+  }));
+
+  document.querySelectorAll(".verifyPreparedBtn").forEach(b=>b.addEventListener("click",async()=>{
+    const id=b.closest(".storage-card").dataset.id;
+    try{
+      b.disabled=true;
+      toast("Final verification started");
+      const result=await api("/api/media/"+encodeURIComponent(id)+"/verify-prepared",{method:"POST",body:"{}"});
+      await refreshStorageOnly();
+      toast(result.state==="ready" ? "Video verified and READY" : "Verification still failed", result.state!=="ready");
     }catch(e){
       toast(e.message,true);
       await refreshStorageOnly();

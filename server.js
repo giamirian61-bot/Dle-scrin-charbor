@@ -30,6 +30,7 @@ const app = express();
 app.set("trust proxy", 1);
 
 const PORT = 3000;
+const PREPARE_THREADS = Math.min(4, Math.max(1, Number(process.env.PREPARE_THREADS || 2) || 2));
 const MEDIA_DIR = process.env.MEDIA_DIR || "/data/media";
 const STREAM_CACHE_DIR = process.env.STREAM_CACHE_DIR || "/tmp/stream-harbor-cache";
 const STREAM_CACHE_RESERVE_BYTES = Math.max(
@@ -874,6 +875,28 @@ async function removeBucketMedia(id) {
   const state = await readBucketMediaState();
   const next = state.items.filter(item => item.id !== String(id));
   await writeBucketMediaState({ items:next });
+}
+
+async function recoverInterruptedBucketPreparation() {
+  const state = await readBucketMediaState();
+  let changed = false;
+  const now = new Date().toISOString();
+  const items = state.items.map(item => {
+    if (!["PREPARING","PREPARE_QUEUED"].includes(item?.status)) return item;
+    changed = true;
+    return {
+      ...item,
+      status:"PREPARE_NEEDED",
+      prepareProgressPct:0,
+      prepareError:"interrupted_by_restart",
+      queuedAt:null,
+      updatedAt:now
+    };
+  });
+  if (changed) {
+    await writeBucketMediaState({ items });
+    console.log(JSON.stringify({ event:"prepare_state_recovered", recovered:true }));
+  }
 }
 
 function publicBucketMedia(item) {
@@ -2014,8 +2037,8 @@ async function prepareBucketMedia(mediaId) {
     "-map","0:a:0?",
     "-c:v","libx264",
     "-preset","veryfast",
-    "-threads","1",
-    "-x264-params","threads=1:lookahead_threads=1:sync-lookahead=0:rc-lookahead=0",
+    "-threads",String(PREPARE_THREADS),
+    "-x264-params",`threads=${PREPARE_THREADS}:lookahead_threads=1:sync-lookahead=0:rc-lookahead=10`,
     "-vf","fps=30,format=yuv420p,setpts=N/(30*TB)",
     "-fps_mode:v","cfr",
     "-g","60",
@@ -4159,6 +4182,7 @@ app.use((err, _req, res, _next) => {
 });
 
 await readBucketMediaState();
+await recoverInterruptedBucketPreparation();
 await readStreamConfigs();
 
 const server = app.listen(PORT, "0.0.0.0", () => {

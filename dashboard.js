@@ -129,6 +129,7 @@ function storageCard(m){
     <div class="storage-meta">
       <div>Status: ${esc(m.status||"UNKNOWN")}</div>
       ${m.error?'<div class="storage-error">Error: '+esc(m.error)+'</div>':""}
+      ${m.prepareError?'<div class="storage-error">Prepare: '+esc(m.prepareError)+'</div>':""}
       ${(uploading||stalled)?'<div class="upload-progress-label">'+progressPct+'% · '+esc(m.uploadedParts||0)+'/'+esc(m.totalParts||0)+' parts</div><div class="upload-progress"><span style="width:'+progressPct+'%"></span></div>':""}
       ${m.lastProgressAt&&(uploading||stalled)?'<div>Last progress: '+esc(new Date(m.lastProgressAt).toLocaleTimeString())+'</div>':""}
       <div>${esc(v.codec?String(v.codec).toUpperCase():"")} ${v.width&&v.height?esc(v.width+"×"+v.height):""}</div>

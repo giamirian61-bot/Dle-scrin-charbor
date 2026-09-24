@@ -1089,6 +1089,7 @@ async function analyzeBucketMedia(id) {
 
 const activeSlots = new Map();
 const restartTimers = new Map();
+const pendingStarts = new Map();
 let prepareJob = null;
 const prepareQueue = [];
 const queuedPrepareIds = new Set();
@@ -1376,22 +1377,23 @@ function slotStatusPayload(slotId, desiredState=null) {
   const id = String(slotId);
   const active = activeSlots.get(id);
   const desired = desiredState || null;
+  const pending = pendingStarts.get(id);
 
   if (!active) {
     const restartPending = restartTimers.has(id);
     const wantsRunning = desired?.desired === "running";
-    const state = restartPending ? "restarting" : wantsRunning ? "recovering" : "idle";
+    const state = pending ? "starting" : restartPending ? "restarting" : wantsRunning ? "recovering" : "idle";
     return {
       slotId:id,
       state,
-      desired:desired?.desired || "stopped",
-      mediaId:desired?.mediaId || null,
-      streamId:desired?.streamId || null,
+      desired:pending ? "running" : desired?.desired || "stopped",
+      mediaId:pending?.mediaId || desired?.mediaId || null,
+      streamId:pending?.streamId || desired?.streamId || null,
       keyConfigured:Boolean(streamKeyForSlot(id)),
-      startedAt:null,
+      startedAt:pending?.requestedAt || null,
       metrics:{},
       health:{
-        state:restartPending ? "restarting" : wantsRunning ? "recovering" : "idle",
+        state:pending ? "starting" : restartPending ? "restarting" : wantsRunning ? "recovering" : "idle",
         retryCount:Number(desired?.retryCount || 0),
         lastExitAt:desired?.lastExitAt || null
       },
@@ -1434,6 +1436,8 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
   if (!effectiveStreamKey) throw new Error("slot_stream_key_not_configured");
 
   const source = await resolveStreamSource(mediaId);
+  const pending = pendingStarts.get(id);
+  if (pending?.cancelled) throw new Error("stream_start_cancelled");
   const sourceMeta = (await getBucketMedia(source.id)) || await readMeta(source.id).catch(() => null);
   const sourceName = sourceMeta?.originalName || source.id;
   const baseUrl = String(rtmpUrl || YOUTUBE_RTMPS_BASE).replace(/\/+$/, "");
@@ -1643,9 +1647,88 @@ Slot ${id}: поток восстановлен после перезапуск�
   };
 }
 
+async function queueLocalStreamStart(slotId, mediaId, options={}) {
+  const id = String(slotId);
+  if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
+  if (activeSlots.has(id)) throw new Error("stream_already_active");
+  if (restartTimers.has(id)) throw new Error("stream_restart_pending");
+  if (pendingStarts.has(id)) throw new Error("stream_start_pending");
+
+  const requestedAt = new Date().toISOString();
+  const pending = {
+    slotId:id,
+    mediaId:path.basename(String(mediaId || "")),
+    streamId:options.streamId || null,
+    requestedAt,
+    cancelled:false
+  };
+  pendingStarts.set(id, pending);
+
+  await updateSlotState(id, {
+    desired:"running",
+    mediaId:pending.mediaId,
+    streamId:pending.streamId,
+    requestedAt,
+    lastError:null
+  });
+
+  void logEvent("stream_start_requested", {
+    slotId:id,
+    mediaId:pending.mediaId,
+    streamId:pending.streamId
+  });
+
+  void (async () => {
+    try {
+      await startStreamInternal(id, pending.mediaId, options);
+    } catch (err) {
+      const message = sanitizeLog(err?.message || err);
+      const cancelled = message === "stream_start_cancelled";
+      await updateSlotState(id, {
+        desired:"stopped",
+        stoppedAt:new Date().toISOString(),
+        lastError:cancelled ? null : message
+      }).catch(() => {});
+
+      void logEvent(cancelled ? "stream_start_cancelled" : "stream_start_failed", {
+        slotId:id,
+        mediaId:pending.mediaId,
+        streamId:pending.streamId,
+        ...(cancelled ? {} : { error:message })
+      });
+
+      if (!cancelled) {
+        console.error(JSON.stringify({
+          event:"stream_start_background_failed",
+          slotId:id,
+          mediaId:pending.mediaId,
+          error:message
+        }));
+        void notifyTelegram(`🚨 Stream Harbor
+Slot ${id}: запуск не удался
+Ошибка: ${message}`);
+      }
+    } finally {
+      const current = pendingStarts.get(id);
+      if (current === pending) pendingStarts.delete(id);
+    }
+  })();
+
+  return {
+    slotId:id,
+    mediaId:pending.mediaId,
+    streamId:pending.streamId,
+    requestedAt,
+    state:"starting"
+  };
+}
+
 async function stopSlot(slotId) {
   const id = String(slotId);
   if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
+
+  const pending = pendingStarts.get(id);
+  if (pending) pending.cancelled = true;
 
   const timer = restartTimers.get(id);
   if (timer) clearTimeout(timer);
@@ -1660,7 +1743,7 @@ async function stopSlot(slotId) {
   });
 
   const active = activeSlots.get(id);
-  if (!active) return { ok:true, slotId:id, state:"idle" };
+  if (!active) return { ok:true, slotId:id, state:pending ? "stopping" : "idle" };
 
   const stopMeta = (await getBucketMedia(active.file)) || await readMeta(active.file).catch(() => null);
   const stopName = stopMeta?.originalName || active.file;
@@ -2549,6 +2632,7 @@ app.get("/health", async (_req, res) => res.json({
   ok:true,
   ffmpeg:true,
   streamingSlots:activeSlots.size,
+  startingSlots:pendingStarts.size,
   youtubeKeyConfigured:Boolean(YOUTUBE_STREAM_KEY),
   telegramConfigured:telegramConfigured(),
   bucketConfigured:bucketConfigured(),
@@ -2565,6 +2649,7 @@ app.get("/api/system", requireOwner, async (_req, res) => {
   res.json({
     ok:true,
     streamingSlots:activeSlots.size,
+    startingSlots:pendingStarts.size,
     preparing:Boolean(prepareJob),
     prepareQueueLength:prepareQueue.length,
     slotCount:STREAM_SLOT_COUNT,
@@ -3235,6 +3320,9 @@ app.get("/api/prepare/status", requireOwner, (_req, res) => {
 
 function streamErrorStatus(msg) {
   return msg === "stream_already_active" ? 409 :
+    msg === "stream_start_pending" ? 409 :
+    msg === "stream_restart_pending" ? 409 :
+    msg === "stream_start_cancelled" ? 409 :
     msg === "slot_stream_key_not_configured" ? 503 :
     msg === "invalid_slot" ? 400 :
     msg === "invalid_media_id" ? 400 :
@@ -3530,12 +3618,12 @@ Slot ${item.slotId}: передан worker ${nodeId}
       });
     }
 
-    const result = await startStreamInternal(String(item.slotId), item.mediaId, {
+    const result = await queueLocalStreamStart(String(item.slotId), item.mediaId, {
       streamKey:key,
       streamId:item.id,
       rtmpUrl:item.rtmpUrl || YOUTUBE_RTMPS_BASE
     });
-    res.json({ ok:true, state:"starting", ...result });
+    res.status(202).json({ ok:true, ...result });
   } catch (err) {
     const msg = String(err?.message || err);
     res.status(streamErrorStatus(msg)).json({ error:msg });
@@ -3656,8 +3744,8 @@ app.get("/api/slots/:slotId/status", requireOwner, async (req, res) => {
 
 app.post("/api/slots/:slotId/start", requireOwner, async (req, res) => {
   try {
-    const result = await startStreamInternal(req.params.slotId, req.body?.mediaId);
-    res.json({ ok:true, state:"starting", ...result });
+    const result = await queueLocalStreamStart(req.params.slotId, req.body?.mediaId);
+    res.status(202).json({ ok:true, ...result });
   } catch (err) {
     const msg = String(err?.message || err);
     res.status(streamErrorStatus(msg)).json({ error:msg });
@@ -3676,8 +3764,8 @@ app.post("/api/slots/:slotId/stop", requireOwner, async (req, res) => {
 // Backwards-compatible single-stream aliases map to slot 1.
 app.post("/api/stream/start", requireOwner, async (req, res) => {
   try {
-    const result = await startStreamInternal("1", req.body?.mediaId);
-    res.json({ ok:true, state:"starting", ...result });
+    const result = await queueLocalStreamStart("1", req.body?.mediaId);
+    res.status(202).json({ ok:true, ...result });
   } catch (err) {
     const msg = String(err?.message || err);
     res.status(streamErrorStatus(msg)).json({ error:msg });

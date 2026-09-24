@@ -40,7 +40,7 @@ jobs:
       - name: Verify loop-safe media normalization
         run: |
           node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['const BITRATE_POLICY_VERSION = 3;','realFrameRate:video.r_frame_rate','loop_timing_normalization_required','fps=30,format=yuv420p,setpts=N/(30*TB)','aresample=48000:async=1:first_pts=0,apad','\"-shortest\"']) if(!s.includes(needle)) throw new Error('missing loop stability contract: '+needle);"
-          node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('const sourceProfile = chooseProfile(item.probe || {});')) throw new Error('bucket preparation still trusts stale profile');"
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('sourceProfile = chooseProfile(sourceProbe);')) throw new Error('bucket preparation does not re-evaluate the current source probe');"
 
       - name: Verify preparation speed and recovery contract
         run: |
@@ -57,3 +57,7 @@ jobs:
         run: |
           node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['const recoveredPrepareIds = await recoverInterruptedBucketPreparation();','prepareQueue.push({ mediaId, queuedAt:new Date().toISOString() })','setImmediate(() => runNextPrepareJob()','const livePrepareStatus =','prepareJob?.mediaId === item?.id ? \"PREPARING\"','queuedPrepareIds.has(String(item?.id)) ? \"PREPARE_QUEUED\"']) if(!s.includes(needle)) throw new Error('missing prepare queue recovery contract: '+needle);"
           node -e "const s=require('fs').readFileSync('server.js','utf8'); if(s.includes('\"PREPARING\",\"PREPARE_QUEUED\",\n    \"PREPARE_FAILED\"')) throw new Error('stale persisted preparing statuses still drive public status');"
+
+      - name: Verify re-probe before full preparation
+        run: |
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['sourceProbe = await analyzeRemoteMedia(sourceUrl, item.size || null);','sourceProfile = chooseProfile(sourceProbe);','bitratePolicyVersion:BITRATE_POLICY_VERSION','return { state:\"already_ready\", mediaId:id, profile:sourceProfile };']) if(!s.includes(needle)) throw new Error('missing re-probe contract: '+needle);"

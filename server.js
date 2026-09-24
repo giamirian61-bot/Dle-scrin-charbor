@@ -2024,12 +2024,36 @@ async function prepareBucketMedia(mediaId) {
   let item = await getBucketMedia(id);
   if (!item) throw new Error("bucket_media_not_found");
 
-  const sourceProfile = chooseProfile(item.probe || {});
+  const sourceUrl = await createBucketReadUrl(item.key, 21600);
+  let sourceProbe = item.probe || {};
+  let sourceProfile = chooseProfile(sourceProbe);
+
+  // Re-probe the source with the current analyzer before doing an expensive
+  // full transcode. Older metadata may lack timing fields introduced by a
+  // newer policy version even when the underlying file is already loop-safe.
+  if (!sourceProfile.streamReady || Number(item.bitratePolicyVersion || 0) < BITRATE_POLICY_VERSION) {
+    sourceProbe = await analyzeRemoteMedia(sourceUrl, item.size || null);
+    sourceProfile = chooseProfile(sourceProbe);
+    item = {
+      ...item,
+      probe:sourceProbe,
+      profile:sourceProfile,
+      analyzedAt:new Date().toISOString(),
+      bitratePolicyVersion:BITRATE_POLICY_VERSION,
+      updatedAt:new Date().toISOString()
+    };
+    await upsertBucketMedia(item);
+  }
+
   if (sourceProfile.streamReady) {
     item = {
       ...item,
       status:"READY_DIRECT",
+      prepareUploadId:null,
       prepareProgressPct:100,
+      preparedUploadedBytes:0,
+      prepareStartedAt:null,
+      queuedAt:null,
       prepareError:null,
       updatedAt:new Date().toISOString()
     };
@@ -2037,7 +2061,6 @@ async function prepareBucketMedia(mediaId) {
     return { state:"already_ready", mediaId:id, profile:sourceProfile };
   }
 
-  const sourceUrl = await createBucketReadUrl(item.key, 21600);
   const kbps = Number(sourceProfile.targetVideoBitrate || sourceProfile.recommendedVideoBitrate || 2500);
   const preparedKey = "prepared/" + id.replace(/\.[^.]+$/, "") + "-" + crypto.randomUUID() + ".mp4";
   const { uploadId } = await startMultipartUpload({ key:preparedKey, contentType:"video/mp4" });

@@ -243,12 +243,20 @@ function wireStreams(){
     card.querySelector(".saveBtn").addEventListener("click",()=>saveStream(card,id));
 
     card.querySelector(".startBtn").addEventListener("click",async()=>{
+      const btn=card.querySelector(".startBtn");
       try{
+        btn.disabled=true;
+        toast("Caching video locally before stream…");
         await saveStream(card,id,true);
-        await api("/api/streams/"+encodeURIComponent(id)+"/start",{method:"POST",body:"{}"});
-        toast("Stream started");
+        const started=await api("/api/streams/"+encodeURIComponent(id)+"/start",{method:"POST",body:"{}"});
+        toast(started.cacheHit ? "Stream started from local cache" : "Cached locally. Stream started");
         setTimeout(loadAll,1200);
-      }catch(e){toast(e.message,true)}
+      }catch(e){
+        toast(e.message,true);
+        setTimeout(loadAll,800);
+      }finally{
+        setTimeout(()=>{ try{btn.disabled=false}catch{} },1500);
+      }
     });
 
     card.querySelector(".stopBtn").addEventListener("click",async()=>{

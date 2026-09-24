@@ -3538,7 +3538,8 @@ app.post("/api/streams/:id/start", requireOwner, async (req, res) => {
     if (!item) return res.status(404).json({ error:"stream_not_found" });
     if (!item.mediaId) return res.status(409).json({ error:"stream_media_not_selected" });
 
-    const key = decryptSecret(item.keySecret) || streamKeyForSlot(String(item.slotId));
+    const slotId = String(item.slotId);
+    const key = decryptSecret(item.keySecret) || streamKeyForSlot(slotId);
     if (!key) return res.status(409).json({ error:"stream_key_not_configured" });
 
     if (STREAM_EXECUTION_MODE === "remote") {
@@ -3547,10 +3548,10 @@ app.post("/api/streams/:id/start", requireOwner, async (req, res) => {
       if (!media || media.status !== "READY_DIRECT" || !effectiveProfile?.streamReady) {
         return res.status(409).json({ error:"remote_media_not_ready" });
       }
-      const nodeId = workerNodeForSlot(String(item.slotId));
+      const nodeId = workerNodeForSlot(slotId);
       if (!nodeId) return res.status(409).json({ error:"remote_worker_not_assigned" });
 
-      await updateSlotState(String(item.slotId), {
+      await updateSlotState(slotId, {
         desired:"running",
         mediaId:item.mediaId,
         streamId:item.id,
@@ -3558,25 +3559,81 @@ app.post("/api/streams/:id/start", requireOwner, async (req, res) => {
       });
 
       void notifyTelegram(`▶️ Stream Harbor
-Slot ${item.slotId}: передан worker ${nodeId}
+Slot ${slotId}: передан worker ${nodeId}
 Файл: ${media.originalName || media.id}`);
 
-      return res.json({
+      return res.status(202).json({
         ok:true,
+        accepted:true,
         state:"starting",
-        slotId:String(item.slotId),
+        slotId,
         mediaId:item.mediaId,
         workerNodeId:nodeId,
         sourceKind:"remote_worker"
       });
     }
 
-    const result = await startStreamInternal(String(item.slotId), item.mediaId, {
+    if (startingSlots.has(slotId)) return res.status(409).json({ error:"stream_start_in_progress" });
+    if (activeSlots.has(slotId)) return res.status(409).json({ error:"stream_already_active" });
+    if (restartTimers.has(slotId)) return res.status(409).json({ error:"stream_restart_pending" });
+
+    await updateSlotState(slotId, {
+      desired:"stopped",
+      mediaId:item.mediaId,
+      streamId:item.id,
+      requestedAt:new Date().toISOString(),
+      lastError:null,
+      retryCount:0
+    });
+
+    void logEvent("stream_start_requested", {
+      slotId,
+      mediaId:item.mediaId,
+      streamId:item.id
+    });
+
+    const startPromise = startStreamInternal(slotId, item.mediaId, {
       streamKey:key,
       streamId:item.id,
       rtmpUrl:item.rtmpUrl || YOUTUBE_RTMPS_BASE
     });
-    res.json({ ok:true, state:"starting", ...result });
+
+    void startPromise.catch(async err => {
+      const msg = sanitizeLog(err?.message || err);
+      await updateSlotState(slotId, {
+        desired:"stopped",
+        streamId:null,
+        lastError:`start_failed: ${msg}`,
+        stoppedAt:new Date().toISOString()
+      }).catch(() => {});
+
+      console.error(JSON.stringify({
+        event:"stream_start_failed",
+        slotId,
+        mediaId:item.mediaId,
+        streamId:item.id,
+        error:msg
+      }));
+
+      void logEvent("stream_start_failed", {
+        slotId,
+        mediaId:item.mediaId,
+        streamId:item.id,
+        error:msg
+      });
+
+      void notifyTelegram(`🚨 Stream Harbor
+Slot ${slotId}: запуск не удался
+Ошибка: ${msg}`);
+    });
+
+    return res.status(202).json({
+      ok:true,
+      accepted:true,
+      state:"starting",
+      slotId,
+      mediaId:item.mediaId
+    });
   } catch (err) {
     const msg = String(err?.message || err);
     res.status(streamErrorStatus(msg)).json({ error:msg });

@@ -36,3 +36,8 @@ jobs:
         run: |
           node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('res.status(202).json')) throw new Error('missing 202 start acknowledgement'); if(!s.includes('stream_start_requested')) throw new Error('missing start requested event'); if(!s.includes('stream_start_failed')) throw new Error('missing background start failure handling');"
           node -e "const s=require('fs').readFileSync('dashboard.js','utf8'); if(!s.includes('waitForMediaFlow(streamId,timeoutMs=90_000)')) throw new Error('media flow wait not hardened');"
+
+      - name: Verify loop-safe media normalization
+        run: |
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['const BITRATE_POLICY_VERSION = 3;','realFrameRate:video.r_frame_rate','loop_timing_normalization_required','fps=30,format=yuv420p,setpts=N/(30*TB)','aresample=48000:async=1:first_pts=0,apad','\"-shortest\"']) if(!s.includes(needle)) throw new Error('missing loop stability contract: '+needle);"
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('const sourceProfile = chooseProfile(item.probe || {});')) throw new Error('bucket preparation still trusts stale profile');"

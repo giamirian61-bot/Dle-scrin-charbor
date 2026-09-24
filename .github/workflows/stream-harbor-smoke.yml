@@ -44,5 +44,5 @@ jobs:
 
       - name: Verify preparation speed and recovery contract
         run: |
-          node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['recoverInterruptedBucketPreparation','prepare_state_recovered','\"-preset\",\"ultrafast\"','\"-tune\",\"zerolatency\"','\"-r\",\"30\"']) if(!s.includes(needle)) throw new Error('missing preparation contract: '+needle);"
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['recoverInterruptedBucketPreparation','prepare_state_recovered','\"-preset\",\"ultrafast\"','\"-tune\",\"zerolatency\"','fps=30,format=yuv420p,setpts=N/(30*TB)']) if(!s.includes(needle)) throw new Error('missing preparation contract: '+needle);"
           node -e "const s=require('fs').readFileSync('server.js','utf8'); if(s.includes('\"-threads\",String(PREPARE_THREADS)')) throw new Error('bucket preparation still manually caps x264 threads'); if(!s.includes('status:\"PREPARE_NEEDED\"')) throw new Error('interrupted preparation is not reset');"

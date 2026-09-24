@@ -3731,8 +3731,8 @@ app.post("/api/streams/:id/start", requireOwner, async (req, res) => {
 
     if (STREAM_EXECUTION_MODE === "remote") {
       const media = await getBucketMedia(item.mediaId);
-      const effectiveProfile = media?.preparedProfile || media?.profile;
-      if (!media || media.status !== "READY_DIRECT" || !effectiveProfile?.streamReady) {
+      const effectiveVariant = media ? chooseEffectiveBucketVariant(media) : { ready:false };
+      if (!media || !effectiveVariant.ready) {
         return res.status(409).json({ error:"remote_media_not_ready" });
       }
       const nodeId = workerNodeForSlot(slotId);

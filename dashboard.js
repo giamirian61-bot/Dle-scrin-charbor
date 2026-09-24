@@ -109,7 +109,7 @@ function celebrateStreamAction(kind){
   try{
     playCelebrationTone(kind);
     const text=kind==="stop"
-      ?"Ты стал немножечко популярнее и богат!"
+      ?"Ты стал немножечко популярнее и богаче!"
       :"Ты на пути успеха!";
     setTimeout(()=>speakCelebration(text),kind==="stop"?650:700);
   }catch{}

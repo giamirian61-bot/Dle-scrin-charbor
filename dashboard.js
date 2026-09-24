@@ -29,6 +29,24 @@ function toast(msg,error=false){
   setTimeout(()=>el.classList.add("hidden"),3500);
 }
 
+let celebrationAudioCtx=null;
+
+function primeCelebrationAudio(){
+  try{
+    const AudioCtx=window.AudioContext||window.webkitAudioContext;
+    if(!AudioCtx) return null;
+    if(!celebrationAudioCtx || celebrationAudioCtx.state==="closed"){
+      celebrationAudioCtx=new AudioCtx();
+    }
+    if(celebrationAudioCtx.state==="suspended"){
+      void celebrationAudioCtx.resume().catch(()=>{});
+    }
+    return celebrationAudioCtx;
+  }catch{
+    return null;
+  }
+}
+
 function speakCelebration(text){
   try{
     if(!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) return;
@@ -46,9 +64,8 @@ function speakCelebration(text){
 
 function playCelebrationTone(kind="start"){
   try{
-    const AudioCtx=window.AudioContext||window.webkitAudioContext;
-    if(!AudioCtx) return;
-    const ctx=new AudioCtx();
+    const ctx=primeCelebrationAudio();
+    if(!ctx) return;
     const master=ctx.createGain();
     master.gain.setValueAtTime(0.0001,ctx.currentTime);
     master.gain.exponentialRampToValueAtTime(0.16,ctx.currentTime+0.02);
@@ -83,7 +100,6 @@ function playCelebrationTone(kind="start"){
       osc.stop(ctx.currentTime+offset+duration+0.03);
     }
 
-    setTimeout(()=>ctx.close().catch(()=>{}),1800);
   }catch{}
 }
 
@@ -546,6 +562,7 @@ function wireStreams(){
     card.querySelector(".saveBtn")?.addEventListener("click",()=>saveStream(card,id));
 
     card.querySelector(".startBtn")?.addEventListener("click",async()=>{
+      primeCelebrationAudio();
       const btn=card.querySelector(".startBtn");
       try{
         btn.disabled=true;
@@ -581,6 +598,7 @@ function wireStreams(){
 
     card.querySelector(".stopBtn")?.addEventListener("click",async()=>{
       if(!confirm("Stop this stream?")) return;
+      primeCelebrationAudio();
       try{
         card.querySelector(".stopBtn").disabled=true;
         await api("/api/streams/"+encodeURIComponent(id)+"/stop",{method:"POST",body:"{}"});

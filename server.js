@@ -696,6 +696,10 @@ function publicStreamConfig(item, state) {
   const runtime = STREAM_EXECUTION_MODE === "remote"
     ? remoteSlotStatusPayload(String(item.slotId), slotState)
     : slotStatusPayload(String(item.slotId), slotState);
+  const savedKey = decryptSecret(item.keySecret);
+  const fallbackKey = streamKeyForSlot(String(item.slotId));
+  const keySource = savedKey ? "saved" : fallbackKey ? "environment" : "none";
+
   return {
     id:item.id,
     slotId:String(item.slotId),
@@ -704,7 +708,8 @@ function publicStreamConfig(item, state) {
     channelUrl:normalizeChannelUrl(item.channelUrl || "", { legacy:true }),
     rtmpUrl:item.rtmpUrl || YOUTUBE_RTMPS_BASE,
     mediaId:item.mediaId || null,
-    keyConfigured:Boolean(decryptSecret(item.keySecret) || streamKeyForSlot(String(item.slotId))),
+    keyConfigured:keySource !== "none",
+    keySource,
     createdAt:item.createdAt || null,
     updatedAt:item.updatedAt || null,
     runtime

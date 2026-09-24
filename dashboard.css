@@ -71,3 +71,14 @@ nav{display:grid;gap:8px}.nav-item{width:100%;border:0;background:transparent;co
   .top-status{font-size:12px}
   .topbar h1{font-size:28px}
 }
+
+.events-list{display:grid;gap:10px}
+.event-row{display:grid;grid-template-columns:190px 1fr;gap:14px;align-items:start;border:1px solid var(--line);background:var(--panel);border-radius:12px;padding:13px 15px}
+.event-time{color:var(--muted);font-size:12px;padding-top:4px}
+.event-main{display:flex;gap:10px;align-items:flex-start;min-width:0}
+.event-badge{flex:0 0 auto;font-size:11px;font-weight:800;padding:5px 8px;border-radius:999px;background:#1d2938;color:#b8c7da}
+.event-badge.ok{background:rgba(45,212,167,.13);color:#57e4bd}
+.event-badge.warning{background:rgba(245,158,11,.14);color:#fbbf24}
+.event-badge.error{background:rgba(208,68,62,.14);color:#ff8781}
+.event-details{color:#b8c5d6;font-size:13px;word-break:break-word;padding-top:3px}
+@media(max-width:720px){.event-row{grid-template-columns:1fr}.event-main{display:grid}}

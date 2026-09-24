@@ -52,3 +52,8 @@ jobs:
         run: |
           node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['const PART_BYTES = 16 * 1024 * 1024;','const MAX_IN_FLIGHT_PARTS = 4;','const inFlight = new Set();','schedulePreparedPart','await Promise.race(inFlight)','await Promise.all(inFlight)','parts.sort((a,b) => a.PartNumber - b.PartNumber)']) if(!s.includes(needle)) throw new Error('missing parallel upload contract: '+needle);"
           node -e "const s=require('fs').readFileSync('server.js','utf8'); if(s.includes('await uploadPreparedPart(body);')) throw new Error('prepared upload still blocks ffmpeg stdout loop');"
+
+      - name: Verify preparation queue recovery contract
+        run: |
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); for (const needle of ['const recoveredPrepareIds = await recoverInterruptedBucketPreparation();','prepareQueue.push({ mediaId, queuedAt:new Date().toISOString() })','setImmediate(() => runNextPrepareJob()','const livePrepareStatus =','prepareJob?.mediaId === item?.id ? \"PREPARING\"','queuedPrepareIds.has(String(item?.id)) ? \"PREPARE_QUEUED\"']) if(!s.includes(needle)) throw new Error('missing prepare queue recovery contract: '+needle);"
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); if(s.includes('\"PREPARING\",\"PREPARE_QUEUED\",\n    \"PREPARE_FAILED\"')) throw new Error('stale persisted preparing statuses still drive public status');"

@@ -45,6 +45,24 @@ const YOUTUBE_STREAM_KEY = process.env.YOUTUBE_STREAM_KEY || "";
 const YOUTUBE_RTMPS_BASE = process.env.YOUTUBE_RTMPS_BASE || "rtmps://a.rtmps.youtube.com/live2";
 const STREAM_SLOT_COUNT = Math.min(8, Math.max(1, Number(process.env.STREAM_SLOT_COUNT || 2)));
 const SLOT_IDS = Array.from({ length:STREAM_SLOT_COUNT }, (_, i) => String(i + 1));
+const STREAM_EXECUTION_MODE = String(process.env.STREAM_EXECUTION_MODE || "local").toLowerCase() === "remote"
+  ? "remote"
+  : "local";
+const WORKER_AGENT_TOKEN = process.env.WORKER_AGENT_TOKEN || "";
+let WORKER_NODE_ASSIGNMENTS = { "worker-a":[...SLOT_IDS] };
+try {
+  const parsed = JSON.parse(process.env.WORKER_NODE_ASSIGNMENTS || "");
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    WORKER_NODE_ASSIGNMENTS = Object.fromEntries(
+      Object.entries(parsed).map(([nodeId,slots]) => [
+        String(nodeId).slice(0,80),
+        Array.isArray(slots)
+          ? slots.map(String).filter(slotId => SLOT_IDS.includes(slotId))
+          : []
+      ])
+    );
+  }
+} catch {}
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 const BITRATE_POLICY_VERSION = 2;
@@ -108,6 +126,14 @@ function requireOwner(req, res, next) {
     res.set("WWW-Authenticate", 'Basic realm="Stream Harbor"');
     return res.status(401).send("Unauthorized");
   }
+  next();
+}
+
+function requireWorkerAgent(req, res, next) {
+  if (!WORKER_AGENT_TOKEN) return res.status(503).json({ error:"worker_agent_not_configured" });
+  const auth = req.get("authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!safeEqual(token, WORKER_AGENT_TOKEN)) return res.status(401).json({ error:"worker_unauthorized" });
   next();
 }
 
@@ -549,9 +575,85 @@ async function getStreamConfig(streamId) {
   return items.find(item => item.id === String(streamId)) || null;
 }
 
+const remoteWorkerNodes = new Map();
+
+function assignedSlotsForNode(nodeId) {
+  return (WORKER_NODE_ASSIGNMENTS[String(nodeId)] || []).filter(slotId => SLOT_IDS.includes(String(slotId)));
+}
+
+function workerNodeForSlot(slotId) {
+  const id = String(slotId);
+  for (const [nodeId,slots] of Object.entries(WORKER_NODE_ASSIGNMENTS)) {
+    if ((slots || []).map(String).includes(id)) return nodeId;
+  }
+  return null;
+}
+
+function remoteSlotStatusPayload(slotId, desiredState=null) {
+  const id = String(slotId);
+  const desired = desiredState || { desired:"stopped" };
+  const nodeId = workerNodeForSlot(id);
+
+  if (!nodeId) {
+    return {
+      slotId:id,
+      state:desired.desired === "running" ? "live_or_starting" : "idle",
+      desired:desired.desired || "stopped",
+      mediaId:desired.mediaId || null,
+      streamId:desired.streamId || null,
+      sourceKind:"remote_worker",
+      health:{ state:"unassigned", nodeId:null }
+    };
+  }
+
+  const node = remoteWorkerNodes.get(nodeId);
+  const lastSeenMs = Date.parse(node?.lastSeenAt || 0);
+  const online = Boolean(lastSeenMs && Date.now() - lastSeenMs < 20_000);
+  const slot = node?.slots?.[id] || null;
+
+  if (online && slot) {
+    return {
+      slotId:id,
+      desired:desired.desired || "stopped",
+      mediaId:slot.mediaId || desired.mediaId || null,
+      streamId:desired.streamId || null,
+      sourceKind:slot.sourceKind || "remote_worker",
+      state:slot.state || (desired.desired === "running" ? "live_or_starting" : "idle"),
+      pid:slot.pid || null,
+      startedAt:slot.startedAt || null,
+      metrics:slot.metrics || {},
+      lastError:slot.lastError || null,
+      health:{
+        ...(slot.health || {}),
+        state:slot.health?.state || "healthy",
+        nodeId,
+        nodeLastSeenAt:node.lastSeenAt
+      }
+    };
+  }
+
+  return {
+    slotId:id,
+    state:desired.desired === "running" ? "live_or_starting" : "idle",
+    desired:desired.desired || "stopped",
+    mediaId:desired.mediaId || null,
+    streamId:desired.streamId || null,
+    sourceKind:"remote_worker",
+    metrics:{},
+    lastError:null,
+    health:{
+      state:online ? "waiting_worker" : "worker_offline",
+      nodeId,
+      nodeLastSeenAt:node?.lastSeenAt || null
+    }
+  };
+}
+
 function publicStreamConfig(item, state) {
   const slotState = state?.slots?.[String(item.slotId)] || { desired:"stopped" };
-  const runtime = slotStatusPayload(String(item.slotId), slotState);
+  const runtime = STREAM_EXECUTION_MODE === "remote"
+    ? remoteSlotStatusPayload(String(item.slotId), slotState)
+    : slotStatusPayload(String(item.slotId), slotState);
   return {
     id:item.id,
     slotId:String(item.slotId),
@@ -2275,6 +2377,8 @@ app.get("/health", async (_req, res) => res.json({
   preparing:Boolean(prepareJob),
   prepareQueueLength:prepareQueue.length,
   slotCount:STREAM_SLOT_COUNT,
+  executionMode:STREAM_EXECUTION_MODE,
+  workerNodes:STREAM_EXECUTION_MODE === "remote" ? [...remoteWorkerNodes.keys()].length : 0,
   storage:await storageStats()
 }));
 
@@ -2285,6 +2389,15 @@ app.get("/api/system", requireOwner, async (_req, res) => {
     preparing:Boolean(prepareJob),
     prepareQueueLength:prepareQueue.length,
     slotCount:STREAM_SLOT_COUNT,
+    executionMode:STREAM_EXECUTION_MODE,
+    workerNodes:STREAM_EXECUTION_MODE === "remote"
+      ? [...remoteWorkerNodes.entries()].map(([nodeId,node]) => ({
+          nodeId,
+          lastSeenAt:node.lastSeenAt,
+          cacheUsedBytes:node.cacheUsedBytes || 0,
+          cacheQuotaBytes:node.cacheQuotaBytes || 0
+        }))
+      : [],
     telegramConfigured:telegramConfigured(),
     storage:await storageStats()
   });
@@ -2866,6 +2979,139 @@ function streamErrorStatus(msg) {
     msg.includes("ENOENT") ? 404 : 422;
 }
 
+app.get("/api/worker-nodes/:nodeId/desired", requireWorkerAgent, async (req, res) => {
+  const nodeId = String(req.params.nodeId || "");
+  const assigned = assignedSlotsForNode(nodeId);
+  if (!assigned.length) return res.status(404).json({ error:"worker_node_not_assigned" });
+
+  const [state, configs] = await Promise.all([readSlotsState(), readStreamConfigs()]);
+  const slots = [];
+
+  for (const slotId of assigned) {
+    const desired = state.slots[slotId] || { desired:"stopped" };
+    if (desired.desired !== "running" || !desired.mediaId) {
+      slots.push({ slotId, desired:"stopped" });
+      continue;
+    }
+
+    const config = configs.find(item =>
+      String(item.slotId) === slotId &&
+      (!desired.streamId || String(item.id) === String(desired.streamId))
+    );
+    if (!config) {
+      slots.push({ slotId, desired:"stopped", error:"stream_config_missing" });
+      continue;
+    }
+
+    const streamKey = decryptSecret(config.keySecret) || streamKeyForSlot(slotId);
+    if (!streamKey) {
+      slots.push({ slotId, desired:"stopped", error:"stream_key_not_configured" });
+      continue;
+    }
+
+    const media = await getBucketMedia(desired.mediaId);
+    const effectiveProfile = media?.preparedProfile || media?.profile;
+    const effectiveSize = Number(media?.preparedSize || media?.size || 0);
+    const effectiveKey = media?.preparedKey || media?.key;
+    if (!media || media.status !== "READY_DIRECT" || !effectiveProfile?.streamReady || !effectiveKey) {
+      slots.push({ slotId, desired:"stopped", error:"remote_media_not_ready" });
+      continue;
+    }
+
+    const configVersion = crypto.createHash("sha256").update(JSON.stringify({
+      slotId,
+      mediaId:media.id,
+      objectKey:effectiveKey,
+      size:effectiveSize,
+      rtmpUrl:config.rtmpUrl || YOUTUBE_RTMPS_BASE,
+      streamKey,
+      requestedAt:desired.requestedAt || null,
+      configUpdatedAt:config.updatedAt || null
+    })).digest("hex");
+
+    slots.push({
+      slotId,
+      desired:"running",
+      streamId:config.id,
+      rtmpUrl:config.rtmpUrl || YOUTUBE_RTMPS_BASE,
+      streamKey,
+      configVersion,
+      media:{
+        id:media.id,
+        originalName:media.originalName || media.id,
+        size:effectiveSize,
+        version:crypto.createHash("sha256").update(String(effectiveKey)+"|"+effectiveSize).digest("hex"),
+        profile:effectiveProfile
+      }
+    });
+  }
+
+  res.json({
+    nodeId,
+    serverTime:new Date().toISOString(),
+    slots
+  });
+});
+
+app.get("/api/worker-nodes/:nodeId/media/:mediaId/source", requireWorkerAgent, async (req, res) => {
+  const nodeId = String(req.params.nodeId || "");
+  const assigned = assignedSlotsForNode(nodeId);
+  if (!assigned.length) return res.status(404).json({ error:"worker_node_not_assigned" });
+
+  const mediaId = path.basename(String(req.params.mediaId || ""));
+  const media = await getBucketMedia(mediaId);
+  if (!media) return res.status(404).json({ error:"bucket_media_not_found" });
+
+  const effectiveKey = media.preparedKey || media.key;
+  const effectiveProfile = media.preparedProfile || media.profile;
+  const effectiveSize = Number(media.preparedSize || media.size || 0);
+  if (media.status !== "READY_DIRECT" || !effectiveProfile?.streamReady || !effectiveKey) {
+    return res.status(409).json({ error:"media_not_ready_direct" });
+  }
+
+  const url = await createBucketReadUrl(effectiveKey, 21600);
+  res.json({
+    id:media.id,
+    originalName:media.originalName || media.id,
+    size:effectiveSize,
+    url,
+    expiresIn:21600
+  });
+});
+
+app.post("/api/worker-nodes/:nodeId/status", requireWorkerAgent, (req, res) => {
+  const nodeId = String(req.params.nodeId || "");
+  const assigned = assignedSlotsForNode(nodeId);
+  if (!assigned.length) return res.status(404).json({ error:"worker_node_not_assigned" });
+
+  const slots = {};
+  for (const raw of Array.isArray(req.body?.slots) ? req.body.slots : []) {
+    const slotId = String(raw?.slotId || "");
+    if (!assigned.includes(slotId)) continue;
+    slots[slotId] = {
+      slotId,
+      state:String(raw?.state || "idle").slice(0,40),
+      pid:Number(raw?.pid || 0) || null,
+      mediaId:raw?.mediaId ? path.basename(String(raw.mediaId)) : null,
+      startedAt:raw?.startedAt || null,
+      sourceKind:"local_cache",
+      metrics:raw?.metrics && typeof raw.metrics === "object" ? raw.metrics : {},
+      health:raw?.health && typeof raw.health === "object" ? raw.health : {},
+      lastError:raw?.lastError ? sanitizeLog(String(raw.lastError)).slice(-800) : null
+    };
+  }
+
+  remoteWorkerNodes.set(nodeId, {
+    nodeId,
+    lastSeenAt:new Date().toISOString(),
+    cacheUsedBytes:Math.max(0,Number(req.body?.cacheUsedBytes || 0)),
+    cacheQuotaBytes:Math.max(0,Number(req.body?.cacheQuotaBytes || 0)),
+    slots
+  });
+
+  res.json({ ok:true, nodeId });
+});
+
 app.get("/api/streams", requireOwner, async (_req, res) => {
   const items = await readStreamConfigs();
   const state = await readSlotsState();
@@ -2968,6 +3214,36 @@ app.post("/api/streams/:id/start", requireOwner, async (req, res) => {
     const key = decryptSecret(item.keySecret) || streamKeyForSlot(String(item.slotId));
     if (!key) return res.status(409).json({ error:"stream_key_not_configured" });
 
+    if (STREAM_EXECUTION_MODE === "remote") {
+      const media = await getBucketMedia(item.mediaId);
+      const effectiveProfile = media?.preparedProfile || media?.profile;
+      if (!media || media.status !== "READY_DIRECT" || !effectiveProfile?.streamReady) {
+        return res.status(409).json({ error:"remote_media_not_ready" });
+      }
+      const nodeId = workerNodeForSlot(String(item.slotId));
+      if (!nodeId) return res.status(409).json({ error:"remote_worker_not_assigned" });
+
+      await updateSlotState(String(item.slotId), {
+        desired:"running",
+        mediaId:item.mediaId,
+        streamId:item.id,
+        requestedAt:new Date().toISOString()
+      });
+
+      void notifyTelegram(`▶️ Stream Harbor
+Slot ${item.slotId}: передан worker ${nodeId}
+Файл: ${media.originalName || media.id}`);
+
+      return res.json({
+        ok:true,
+        state:"starting",
+        slotId:String(item.slotId),
+        mediaId:item.mediaId,
+        workerNodeId:nodeId,
+        sourceKind:"remote_worker"
+      });
+    }
+
     const result = await startStreamInternal(String(item.slotId), item.mediaId, {
       streamKey:key,
       streamId:item.id,
@@ -2983,6 +3259,18 @@ app.post("/api/streams/:id/start", requireOwner, async (req, res) => {
 app.post("/api/streams/:id/stop", requireOwner, async (req, res) => {
   const item = await getStreamConfig(req.params.id);
   if (!item) return res.status(404).json({ error:"stream_not_found" });
+
+  if (STREAM_EXECUTION_MODE === "remote") {
+    await updateSlotState(String(item.slotId), {
+      desired:"stopped",
+      streamId:null,
+      stoppedAt:new Date().toISOString()
+    });
+    void notifyTelegram(`⏹ Stream Harbor
+Slot ${item.slotId}: команда остановки передана remote worker`);
+    return res.json({ ok:true, slotId:String(item.slotId), state:"stopping" });
+  }
+
   res.json(await stopSlot(String(item.slotId)));
 });
 
@@ -2990,7 +3278,16 @@ app.post("/api/streams/stop-all", requireOwner, async (_req, res) => {
   const results = [];
   for (const slotId of SLOT_IDS) {
     try {
-      results.push(await stopSlot(slotId));
+      if (STREAM_EXECUTION_MODE === "remote") {
+        await updateSlotState(slotId, {
+          desired:"stopped",
+          streamId:null,
+          stoppedAt:new Date().toISOString()
+        });
+        results.push({ ok:true, slotId, state:"stopping" });
+      } else {
+        results.push(await stopSlot(slotId));
+      }
     } catch (err) {
       results.push({ ok:false, slotId, error:sanitizeLog(err?.message || err) });
     }
@@ -3409,6 +3706,7 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 Telegram: активен`);
 
   setTimeout(async () => {
+    if (STREAM_EXECUTION_MODE !== "local") return;
     const state = await readSlotsState();
 
     for (const slotId of SLOT_IDS) {

@@ -31,3 +31,8 @@ jobs:
 
       - name: Syntax check dashboard
         run: node --check dashboard.js
+
+      - name: Verify asynchronous stream start contract
+        run: |
+          node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('res.status(202).json')) throw new Error('missing 202 start acknowledgement'); if(!s.includes('stream_start_requested')) throw new Error('missing start requested event'); if(!s.includes('stream_start_failed')) throw new Error('missing background start failure handling');"
+          node -e "const s=require('fs').readFileSync('dashboard.js','utf8'); if(!s.includes('waitForMediaFlow(streamId,timeoutMs=90_000)')) throw new Error('media flow wait not hardened');"

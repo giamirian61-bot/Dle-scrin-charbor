@@ -28,6 +28,90 @@ function toast(msg,error=false){
   el.className="toast"+(error?" error":"");
   setTimeout(()=>el.classList.add("hidden"),3500);
 }
+
+let celebrationAudioCtx=null;
+
+function primeCelebrationAudio(){
+  try{
+    const AudioCtx=window.AudioContext||window.webkitAudioContext;
+    if(!AudioCtx) return null;
+    if(!celebrationAudioCtx || celebrationAudioCtx.state==="closed"){
+      celebrationAudioCtx=new AudioCtx();
+    }
+    if(celebrationAudioCtx.state==="suspended"){
+      void celebrationAudioCtx.resume().catch(()=>{});
+    }
+    return celebrationAudioCtx;
+  }catch{
+    return null;
+  }
+}
+
+function speakCelebration(text){
+  try{
+    if(!("speechSynthesis" in window) || !("SpeechSynthesisUtterance" in window)) return;
+    window.speechSynthesis.cancel();
+    const utterance=new SpeechSynthesisUtterance(text);
+    utterance.lang="ru-RU";
+    utterance.rate=0.95;
+    utterance.pitch=1.05;
+    const voices=window.speechSynthesis.getVoices?.()||[];
+    const ru=voices.find(v=>String(v.lang||"").toLowerCase().startsWith("ru"));
+    if(ru) utterance.voice=ru;
+    window.speechSynthesis.speak(utterance);
+  }catch{}
+}
+
+function playCelebrationTone(kind="start"){
+  try{
+    const ctx=primeCelebrationAudio();
+    if(!ctx) return;
+    const master=ctx.createGain();
+    master.gain.setValueAtTime(0.0001,ctx.currentTime);
+    master.gain.exponentialRampToValueAtTime(0.16,ctx.currentTime+0.02);
+    master.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+1.45);
+    master.connect(ctx.destination);
+
+    const startNotes=[
+      [523.25,0.00,0.18],
+      [659.25,0.16,0.18],
+      [783.99,0.32,0.22],
+      [1046.50,0.52,0.42]
+    ];
+    const stopNotes=[
+      [783.99,0.00,0.16],
+      [659.25,0.14,0.16],
+      [880.00,0.30,0.18],
+      [1046.50,0.48,0.38]
+    ];
+    const notes=kind==="stop"?stopNotes:startNotes;
+
+    for(const [freq,offset,duration] of notes){
+      const osc=ctx.createOscillator();
+      const gain=ctx.createGain();
+      osc.type="triangle";
+      osc.frequency.setValueAtTime(freq,ctx.currentTime+offset);
+      gain.gain.setValueAtTime(0.0001,ctx.currentTime+offset);
+      gain.gain.exponentialRampToValueAtTime(0.20,ctx.currentTime+offset+0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+offset+duration);
+      osc.connect(gain);
+      gain.connect(master);
+      osc.start(ctx.currentTime+offset);
+      osc.stop(ctx.currentTime+offset+duration+0.03);
+    }
+
+  }catch{}
+}
+
+function celebrateStreamAction(kind){
+  try{
+    playCelebrationTone(kind);
+    const text=kind==="stop"
+      ?"Ты стал немножечко популярнее и богаче!"
+      :"Ты на пути успеха!";
+    setTimeout(()=>speakCelebration(text),kind==="stop"?650:700);
+  }catch{}
+}
 async function api(url,opts={}){
   const headers={...(opts.headers||{})};
   if(opts.body!==undefined && !(opts.body instanceof FormData)) headers["Content-Type"]="application/json";
@@ -478,6 +562,7 @@ function wireStreams(){
     card.querySelector(".saveBtn")?.addEventListener("click",()=>saveStream(card,id));
 
     card.querySelector(".startBtn")?.addEventListener("click",async()=>{
+      primeCelebrationAudio();
       const btn=card.querySelector(".startBtn");
       try{
         btn.disabled=true;
@@ -488,6 +573,7 @@ function wireStreams(){
         toast(cache.state==="cached"?"Starting from local cache…":"Caching video locally before stream…");
         const started=await api("/api/streams/"+encodeURIComponent(id)+"/start",{method:"POST",body:"{}"});
         toast(started.cacheHit?"Stream started from local cache":"Stream start requested");
+        celebrateStreamAction("start");
         setTimeout(loadAll,900);
       }catch(e){
         toast(e.message,true);
@@ -512,10 +598,12 @@ function wireStreams(){
 
     card.querySelector(".stopBtn")?.addEventListener("click",async()=>{
       if(!confirm("Stop this stream?")) return;
+      primeCelebrationAudio();
       try{
         card.querySelector(".stopBtn").disabled=true;
         await api("/api/streams/"+encodeURIComponent(id)+"/stop",{method:"POST",body:"{}"});
         toast("Stream stop requested");
+        celebrateStreamAction("stop");
         setTimeout(loadAll,900);
       }catch(e){toast(e.message,true)}
     });

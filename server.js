@@ -881,42 +881,53 @@ async function recoverInterruptedBucketPreparation() {
   const state = await readBucketMediaState();
   let changed = false;
   const now = new Date().toISOString();
+  const recoveredIds = [];
   const items = state.items.map(item => {
     if (!["PREPARING","PREPARE_QUEUED"].includes(item?.status)) return item;
     changed = true;
+    recoveredIds.push(String(item.id));
     return {
       ...item,
       status:"PREPARE_NEEDED",
       prepareProgressPct:0,
+      preparedUploadedBytes:0,
       prepareError:"interrupted_by_restart",
       queuedAt:null,
+      prepareStartedAt:null,
       updatedAt:now
     };
   });
   if (changed) {
     await writeBucketMediaState({ items });
-    console.log(JSON.stringify({ event:"prepare_state_recovered", recovered:true }));
+    console.log(JSON.stringify({ event:"prepare_state_recovered", recoveredIds }));
   }
+  return recoveredIds;
 }
 
 function publicBucketMedia(item) {
   const profile = item?.profile || null;
+  const livePrepareStatus =
+    prepareJob?.mediaId === item?.id ? "PREPARING" :
+    queuedPrepareIds.has(String(item?.id)) ? "PREPARE_QUEUED" :
+    null;
   const transientStatuses = new Set([
-    "UPLOADING","STALLED","UPLOAD_PAUSED","PREPARING","PREPARE_QUEUED",
+    "UPLOADING","STALLED","UPLOAD_PAUSED",
     "PREPARE_FAILED","VERIFYING","VERIFY_FAILED","ERROR"
   ]);
   const preparedProfileNow = item?.preparedProbe ? chooseProfile(item.preparedProbe) : null;
   const sourceProfileNow = item?.probe ? chooseProfile(item.probe) : null;
-  const effectiveStatus = transientStatuses.has(item?.status)
-    ? item.status
-    : item?.preparedKey
+  const effectiveStatus = livePrepareStatus || (
+    transientStatuses.has(item?.status)
+      ? item.status
+      : item?.preparedKey
       ? (
           Number(item?.bitratePolicyVersion || 0) < BITRATE_POLICY_VERSION ||
           !preparedProfileNow?.streamReady
             ? "OPTIMIZE_NEEDED"
             : "READY_DIRECT"
         )
-      : (sourceProfileNow?.streamReady ? "READY_DIRECT" : "PREPARE_NEEDED");
+      : (sourceProfileNow?.streamReady ? "READY_DIRECT" : "PREPARE_NEEDED")
+  );
   return {
     id:item.id,
     sourceType:"bucket",
@@ -2570,8 +2581,18 @@ async function runNextPrepareJob() {
 
   try {
     const bucketMeta = await getBucketMedia(next.mediaId);
-    if (bucketMeta) await prepareBucketMedia(next.mediaId);
-    else await prepareMedia(next.mediaId);
+    if (bucketMeta) {
+      await upsertBucketMedia({
+        ...bucketMeta,
+        status:"PREPARE_QUEUED",
+        queuedAt:next.queuedAt || new Date().toISOString(),
+        prepareError:null,
+        updatedAt:new Date().toISOString()
+      });
+      await prepareBucketMedia(next.mediaId);
+    } else {
+      await prepareMedia(next.mediaId);
+    }
   } catch (err) {
     const message = sanitizeLog(err?.message || err);
     const bucketMeta = await getBucketMedia(next.mediaId);
@@ -4201,8 +4222,19 @@ app.use((err, _req, res, _next) => {
 });
 
 await readBucketMediaState();
-await recoverInterruptedBucketPreparation();
+const recoveredPrepareIds = await recoverInterruptedBucketPreparation();
+for (const mediaId of recoveredPrepareIds) {
+  if (!queuedPrepareIds.has(mediaId)) {
+    prepareQueue.push({ mediaId, queuedAt:new Date().toISOString() });
+    queuedPrepareIds.add(mediaId);
+  }
+}
 await readStreamConfigs();
+if (recoveredPrepareIds.length) {
+  setImmediate(() => runNextPrepareJob().catch(err => {
+    console.error(JSON.stringify({ event:"prepare_recovery_start_failed", error:sanitizeLog(err?.message || err) }));
+  }));
+}
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Stream Harbor backend listening on ${PORT}`);

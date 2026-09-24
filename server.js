@@ -1515,6 +1515,14 @@ Slot ${id}: поток остановлен
   return { ok:true, slotId:id, state:"stopping", pid:active.pid };
 }
 
+async function waitForLocalSlotIdle(slotId, timeoutMs=12_000) {
+  const id = String(slotId);
+  const deadline = Date.now() + Math.max(1000, Number(timeoutMs || 0));
+  while (activeSlots.has(id) && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  return !activeSlots.has(id);
+}
 
 function parseFfmpegSpeed(value) {
   const n = Number(String(value || "").replace(/x$/i, ""));
@@ -2855,6 +2863,37 @@ app.post("/api/media/:id/cache", requireOwner, async (req, res) => {
   }
 });
 
+app.delete("/api/media/:id/cache", requireOwner, async (req, res) => {
+  try {
+    const id = path.basename(String(req.params.id || ""));
+    const item = await getBucketMedia(id);
+    if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+
+    const effectiveKey = item.preparedKey || item.key;
+    const cachePath = streamCacheKeyPath(id, effectiveKey);
+
+    if (streamCacheJobs.has(cachePath)) {
+      return res.status(409).json({ error:"cache_is_building" });
+    }
+
+    const state = await readSlotsState();
+    const isDesiredRunning = SLOT_IDS.some(slotId => {
+      const slot = state.slots?.[slotId];
+      return slot?.desired === "running" && slot?.mediaId === id;
+    });
+    const isLocallyActive = [...activeSlots.values()].some(slot => slot.file === id || slot.streamPath === cachePath);
+
+    if (isDesiredRunning || isLocallyActive) {
+      return res.status(409).json({ error:"file_is_streaming" });
+    }
+
+    await removeCachedMedia(id);
+    res.json({ ok:true, state:"not_cached", mediaId:id });
+  } catch (err) {
+    res.status(422).json({ error:sanitizeLog(err?.message || err) });
+  }
+});
+
 app.post("/api/media", requireOwner, upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error:"file_required" });
 
@@ -2897,8 +2936,24 @@ app.delete("/api/media/:id", requireOwner, async (req, res) => {
   const id = path.basename(req.params.id);
   const target = path.join(MEDIA_DIR, id);
 
-  if ([...activeSlots.values()].some(s => s.file === id)) {
+  const [slotState, streamConfigs] = await Promise.all([
+    readSlotsState(),
+    readStreamConfigs()
+  ]);
+  const assignedStreams = streamConfigs.filter(item => item.mediaId === id);
+  const desiredRunning = SLOT_IDS.some(slotId => {
+    const slot = slotState.slots?.[slotId];
+    return slot?.desired === "running" && slot?.mediaId === id;
+  });
+
+  if ([...activeSlots.values()].some(slot => slot.file === id) || desiredRunning) {
     return res.status(409).json({ error:"file_is_streaming" });
+  }
+  if (assignedStreams.length) {
+    return res.status(409).json({
+      error:"file_assigned_to_stream",
+      streams:assignedStreams.map(item => ({ id:item.id, slotId:String(item.slotId), name:item.name || `Stream ${item.slotId}` }))
+    });
   }
   if (prepareJob?.mediaId === id) {
     return res.status(409).json({ error:"file_is_preparing" });
@@ -3183,11 +3238,16 @@ app.patch("/api/streams/:id", requireOwner, async (req, res) => {
 
   const current = items[idx];
   const next = { ...current };
+  const slotState = await readSlotsState();
+  const live = activeSlots.has(String(current.slotId)) || slotState.slots?.[String(current.slotId)]?.desired === "running";
 
   if (req.body?.name !== undefined) next.name = String(req.body.name || "").slice(0,120);
   if (req.body?.description !== undefined) next.description = String(req.body.description || "").slice(0,1000);
   if (req.body?.channelUrl !== undefined) next.channelUrl = String(req.body.channelUrl || "").slice(0,500);
   if (req.body?.rtmpUrl !== undefined) {
+    if (live && String(req.body.rtmpUrl || "").trim() !== String(current.rtmpUrl || YOUTUBE_RTMPS_BASE)) {
+      return res.status(409).json({ error:"cannot_change_rtmp_while_live" });
+    }
     const value = String(req.body.rtmpUrl || "").trim().slice(0,500);
     if (value && !/^rtmps?:\/\//i.test(value)) {
       return res.status(400).json({ error:"invalid_rtmp_url" });
@@ -3196,6 +3256,12 @@ app.patch("/api/streams/:id", requireOwner, async (req, res) => {
   }
 
   if (req.body?.mediaId !== undefined) {
+    const incomingMediaId = req.body.mediaId === null || req.body.mediaId === ""
+      ? null
+      : path.basename(String(req.body.mediaId));
+    if (live && incomingMediaId !== (current.mediaId || null)) {
+      return res.status(409).json({ error:"cannot_change_media_while_live" });
+    }
     if (req.body.mediaId === null || req.body.mediaId === "") {
       next.mediaId = null;
     } else {
@@ -3205,7 +3271,11 @@ app.patch("/api/streams/:id", requireOwner, async (req, res) => {
     }
   }
 
-  if (req.body?.streamKey) {
+  if (req.body?.clearStreamKey === true) {
+    if (live) return res.status(409).json({ error:"cannot_change_key_while_live" });
+    next.keySecret = null;
+  } else if (req.body?.streamKey) {
+    if (live) return res.status(409).json({ error:"cannot_change_key_while_live" });
     next.keySecret = encryptSecret(String(req.body.streamKey).trim());
   }
 
@@ -3223,7 +3293,9 @@ app.delete("/api/streams/:id", requireOwner, async (req, res) => {
   if (idx < 0) return res.status(404).json({ error:"stream_not_found" });
 
   const item = items[idx];
-  if (activeSlots.has(String(item.slotId))) {
+  const slotState = await readSlotsState();
+  const live = activeSlots.has(String(item.slotId)) || slotState.slots?.[String(item.slotId)]?.desired === "running";
+  if (live) {
     return res.status(409).json({ error:"stream_is_running" });
   }
 
@@ -3282,6 +3354,54 @@ Slot ${item.slotId}: передан worker ${nodeId}
       rtmpUrl:item.rtmpUrl || YOUTUBE_RTMPS_BASE
     });
     res.json({ ok:true, state:"starting", ...result });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    res.status(streamErrorStatus(msg)).json({ error:msg });
+  }
+});
+
+app.post("/api/streams/:id/restart", requireOwner, async (req, res) => {
+  try {
+    const item = await getStreamConfig(req.params.id);
+    if (!item) return res.status(404).json({ error:"stream_not_found" });
+    if (!item.mediaId) return res.status(409).json({ error:"stream_media_not_selected" });
+
+    const slotId = String(item.slotId);
+    const key = decryptSecret(item.keySecret) || streamKeyForSlot(slotId);
+    if (!key) return res.status(409).json({ error:"stream_key_not_configured" });
+
+    const slotState = await readSlotsState();
+    const desired = slotState.slots?.[slotId] || { desired:"stopped" };
+    const consideredLive = activeSlots.has(slotId) || desired.desired === "running";
+    if (!consideredLive) return res.status(409).json({ error:"stream_not_running" });
+
+    if (STREAM_EXECUTION_MODE === "remote") {
+      await updateSlotState(slotId, {
+        desired:"running",
+        mediaId:item.mediaId,
+        streamId:item.id,
+        requestedAt:new Date().toISOString(),
+        restartRequestedAt:new Date().toISOString()
+      });
+      void notifyTelegram(`♻️ Stream Harbor
+Slot ${slotId}: команда restart передана remote worker`);
+      return res.json({ ok:true, state:"restarting", slotId, sourceKind:"remote_worker" });
+    }
+
+    await stopSlot(slotId);
+    const stopped = await waitForLocalSlotIdle(slotId, 12_000);
+    if (!stopped) return res.status(409).json({ error:"stream_stop_timeout" });
+
+    const result = await startStreamInternal(slotId, item.mediaId, {
+      streamKey:key,
+      streamId:item.id,
+      rtmpUrl:item.rtmpUrl || YOUTUBE_RTMPS_BASE
+    });
+
+    void notifyTelegram(`♻️ Stream Harbor
+Slot ${slotId}: поток перезапущен`);
+
+    res.json({ ok:true, state:"restarting", ...result });
   } catch (err) {
     const msg = String(err?.message || err);
     res.status(streamErrorStatus(msg)).json({ error:msg });

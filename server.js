@@ -2016,6 +2016,7 @@ app.post("/api/bucket/multipart/start", requireOwner, async (req, res) => {
   const originalName = String(req.body?.name || "video.mp4").trim().slice(0,240);
   const size = Number(req.body?.size || 0);
   const contentType = String(req.body?.type || "video/mp4");
+  const sourceLastModified = Number(req.body?.lastModified || 0) || null;
 
   if (!size || size < 1) return res.status(400).json({ error:"invalid_file_size" });
   if (size > MAX_BUCKET_FILE_BYTES) return res.status(413).json({ error:"file_too_large" });
@@ -2031,6 +2032,7 @@ app.post("/api/bucket/multipart/start", requireOwner, async (req, res) => {
       item?.uploadId &&
       item.originalName === originalName &&
       Number(item.size) === size &&
+      (!item.sourceLastModified || !sourceLastModified || Number(item.sourceLastModified) === sourceLastModified) &&
       ["UPLOADING","STALLED","UPLOAD_PAUSED"].includes(item.status)
     )
     .sort((a,b) => Date.parse(b.updatedAt || b.createdAt || 0) - Date.parse(a.updatedAt || a.createdAt || 0))[0];
@@ -2105,6 +2107,7 @@ app.post("/api/bucket/multipart/start", requireOwner, async (req, res) => {
     originalName,
     size,
     contentType,
+    sourceLastModified,
     partSize:MULTIPART_PART_BYTES,
     totalParts,
     status:"UPLOADING",
@@ -2179,14 +2182,15 @@ app.post("/api/bucket/multipart/:id/progress", requireOwner, async (req, res) =>
     ? Math.max(0, Math.min(100, (uploadedBytes / Number(item.size)) * 100))
     : 0;
 
+  const latest = await getBucketMedia(id) || item;
   item = {
-    ...item,
+    ...latest,
     status:"UPLOADING",
     error:null,
     stalledAt:null,
-    uploadedParts,
-    uploadedBytes,
-    progressPct,
+    uploadedParts:Math.max(Number(latest.uploadedParts || 0), uploadedParts),
+    uploadedBytes:Math.max(Number(latest.uploadedBytes || 0), uploadedBytes),
+    progressPct:Math.max(Number(latest.progressPct || 0), progressPct),
     lastProgressAt:now,
     updatedAt:now
   };

@@ -1,4 +1,4 @@
-const state={streams:[],media:[],view:"streams"};
+const state={streams:[],media:[],view:"streams",cacheStatus:{}};
 
 function q(s){return document.querySelector(s)}
 function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
@@ -118,8 +118,17 @@ function storageCard(m){
   const source=m.sourceVideoBitrate;
   const target=m.recommendedVideoBitrate;
 
+  const cache=state.cacheStatus[m.id]||null;
   let action;
-  if(ready) action='<button class="btn secondary" disabled>READY</button><button class="btn primary cacheMediaBtn">Pre-cache</button>';
+  if(ready){
+    const cacheAction=
+      cache?.state==="cached"
+        ? '<button class="btn secondary" disabled>Cached</button>'
+        : cache?.state==="caching"
+          ? '<button class="btn primary" disabled>Caching '+Math.max(0,Math.min(99,Math.round(Number(cache.progressPct||0))))+'%</button>'
+          : '<button class="btn primary cacheMediaBtn">Pre-cache</button>';
+    action='<button class="btn secondary" disabled>READY</button>'+cacheAction;
+  }
   else if(preparing) action='<button class="btn primary" disabled>Preparing…</button>';
   else if(verifying) action='<button class="btn secondary" disabled>Verifying…</button>';
   else if(verifyFailed) action='<button class="btn primary verifyPreparedBtn">Retry verification</button>';
@@ -173,11 +182,13 @@ function renderStorage(){
   document.querySelectorAll(".cacheMediaBtn").forEach(b=>b.addEventListener("click",async()=>{
     const id=b.closest(".storage-card").dataset.id;
     try{
-      b.disabled=true;
-      b.textContent="Caching…";
+      state.cacheStatus[id]={state:"caching",progressPct:0};
+      renderStorage();
+
       const started=await api("/api/media/"+encodeURIComponent(id)+"/cache",{method:"POST",body:"{}"});
       if(started.state==="cached"){
-        b.textContent="Cached";
+        state.cacheStatus[id]={state:"cached",progressPct:100,size:started.size||null};
+        renderStorage();
         toast("Video already cached locally");
         return;
       }
@@ -186,21 +197,27 @@ function renderStorage(){
       const deadline=Date.now()+30*60*1000;
       while(Date.now()<deadline){
         await new Promise(r=>setTimeout(r,2000));
-        const st=await api("/api/media/"+encodeURIComponent(id)+"/cache-status");
+        const st=await api(
+          "/api/media/"+encodeURIComponent(id)+"/cache-status",
+          {cache:"no-store"}
+        );
+        state.cacheStatus[id]=st;
+        renderStorage();
+
         if(st.state==="cached"){
-          b.textContent="Cached";
           toast("Video cached and ready for instant start");
           return;
         }
-        if(st.state==="not_cached" && Date.now()+5000>deadline) break;
+        if(st.state==="not_cached"){
+          toast("Pre-caching stopped or failed",true);
+          return;
+        }
       }
 
-      b.disabled=false;
-      b.textContent="Pre-cache";
       toast("Caching is still not complete",true);
     }catch(e){
-      b.disabled=false;
-      b.textContent="Pre-cache";
+      state.cacheStatus[id]={state:"not_cached",progressPct:0};
+      renderStorage();
       toast(e.message,true);
     }
   }));
@@ -348,10 +365,23 @@ async function saveStream(card,id,silent=false){
   if(!silent) toast("Settings saved ✓");
 }
 
+async function refreshCacheStatuses(){
+  const readyBucket=state.media.filter(m=>m.sourceType==="bucket" && m.status==="READY_DIRECT");
+  await Promise.all(readyBucket.map(async m=>{
+    try{
+      state.cacheStatus[m.id]=await api(
+        "/api/media/"+encodeURIComponent(m.id)+"/cache-status",
+        {cache:"no-store"}
+      );
+    }catch{}
+  }));
+}
+
 async function refreshStorageOnly(){
   try{
     const m=await api("/api/media");
     state.media=m.items||[];
+    await refreshCacheStatuses();
     renderStorage();
   }catch(e){
     toast(e.message,true);
@@ -433,6 +463,7 @@ async function loadAll(){
     const [s,m,h]=await Promise.all([api("/api/streams"),api("/api/media"),fetch("/health").then(r=>r.json())]);
     state.streams=s.items||[]; state.media=m.items||[];
     q("#serverStatus").textContent=h.ok?"Server online":"Server problem";
+    await refreshCacheStatuses();
     renderStreams();renderStorage();
     api("/api/prepare/status").then(p=>{
       if(p.state!=="idle" || (p.queue&&p.queue.length)) pollPrepareQueue();

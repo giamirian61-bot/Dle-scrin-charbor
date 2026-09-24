@@ -116,7 +116,7 @@ function streamCard(s){
     <div class="field">
       <label>Stream key</label>
       <div class="key-status ${s.keyConfigured?"saved":""}">
-        ${s.keyConfigured?"✓ Stream key saved":"Stream key not configured"}
+        ${s.keySource==="environment"?"✓ Server key active":s.keyConfigured?"✓ Stream key saved":"Stream key not configured"}
       </div>
       <div class="key-row">
         <input class="input streamKey masked-key" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
@@ -124,9 +124,15 @@ function streamCard(s){
           placeholder="${s.keyConfigured?"Enter a new key only to replace the saved one":"Enter stream key"}"
           ${live?"disabled":""}>
         <button class="eye" type="button" title="Show/hide typed key" ${live||s.keyConfigured?"disabled":""}>◉</button>
-        <button class="btn secondary clearKeyBtn" type="button" ${live||!s.keyConfigured?"disabled":""}>Clear key</button>
+        <button class="btn secondary clearKeyBtn" type="button" ${live||!s.keyConfigured||s.keySource==="environment"?"disabled":""}>${s.keySource==="environment"?"Server key":"Clear key"}</button>
       </div>
-      <div class="field-help">${live?"Stream key is locked while LIVE.":(s.keyConfigured?"Saved key stays encrypted on the server. Leave this field blank to keep it.":"Paste the YouTube stream key here.")}</div>
+      <div class="field-help">${live
+        ?"Stream key is locked while LIVE."
+        :s.keySource==="environment"
+          ?"This slot currently uses the server-managed key. Enter a new key only to override it."
+          :s.keyConfigured
+            ?"Saved key stays encrypted on the server. Leave this field blank to keep it."
+            :"Paste the YouTube stream key here."}</div>
     </div>
 
     <div class="media-box">
@@ -551,6 +557,7 @@ async function saveStream(card,id,silent=false){
 
   if(stream){
     stream.keyConfigured=Boolean(saved.keyConfigured);
+    stream.keySource=saved.keySource;
     stream.name=saved.name;
     stream.description=saved.description;
     stream.channelUrl=saved.channelUrl;
@@ -618,6 +625,7 @@ async function refreshRuntime(){
       if(current){
         current.runtime=incoming.runtime;
         current.keyConfigured=incoming.keyConfigured;
+        current.keySource=incoming.keySource;
         current.channelUrl=incoming.channelUrl;
       }
 
@@ -660,7 +668,11 @@ async function refreshRuntime(){
       if(deleteBtn) deleteBtn.disabled=live;
       if(mediaSelect) mediaSelect.disabled=live;
       if(keyInput) keyInput.disabled=live;
-      if(clearKeyBtn) clearKeyBtn.disabled=live||!incoming.keyConfigured;
+      if(clearKeyBtn){
+        const envKey=incoming.keySource==="environment";
+        clearKeyBtn.disabled=live||!incoming.keyConfigured||envKey;
+        clearKeyBtn.textContent=envKey?"Server key":"Clear key";
+      }
       if(cacheBtn){
         const ctl=cacheButtonState(mediaId,live);
         cacheBtn.textContent=ctl.text;

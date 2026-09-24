@@ -1332,13 +1332,24 @@ function slotStatusPayload(slotId, desiredState=null) {
   const desired = desiredState || null;
 
   if (!active) {
+    const restartPending = restartTimers.has(id);
+    const wantsRunning = desired?.desired === "running";
+    const state = restartPending ? "restarting" : wantsRunning ? "recovering" : "idle";
     return {
       slotId:id,
-      state:"idle",
+      state,
       desired:desired?.desired || "stopped",
       mediaId:desired?.mediaId || null,
       streamId:desired?.streamId || null,
-      keyConfigured:Boolean(streamKeyForSlot(id))
+      keyConfigured:Boolean(streamKeyForSlot(id)),
+      startedAt:null,
+      metrics:{},
+      health:{
+        state:restartPending ? "restarting" : wantsRunning ? "recovering" : "idle",
+        retryCount:Number(desired?.retryCount || 0),
+        lastExitAt:desired?.lastExitAt || null
+      },
+      lastError:desired?.lastError || null
     };
   }
 
@@ -1371,6 +1382,7 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
   const id = String(slotId);
   if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
   if (activeSlots.has(id)) throw new Error("stream_already_active");
+  if (restartTimers.has(id)) throw new Error("stream_restart_pending");
 
   const effectiveStreamKey = streamKey || streamKeyForSlot(id);
   if (!effectiveStreamKey) throw new Error("slot_stream_key_not_configured");
@@ -1455,6 +1467,15 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
 
     if (snapshot?.intentionalStop) return;
 
+    const exitError = snapshot?.lastError || `worker_exit code=${code ?? "null"} signal=${signal ?? "null"}`;
+    await updateSlotState(id, {
+      lastError:sanitizeLog(exitError),
+      lastExitAt:new Date().toISOString(),
+      lastExitCode:code ?? null,
+      lastExitSignal:signal ?? null,
+      retryCount:Number(retryCount || 0)
+    }).catch(() => {});
+
     void notifyTelegram(`⚠️ Stream Harbor
 Slot ${id}: FFmpeg/worker завершился аварийно
 Файл: ${sourceName}
@@ -1505,12 +1526,25 @@ Slot ${id}: автоперезапуск не удался
       desired:"running",
       mediaId:source.id,
       streamId:streamId || null,
-      requestedAt:new Date().toISOString()
+      requestedAt:new Date().toISOString(),
+      lastError:null,
+      lastExitAt:null,
+      lastExitCode:null,
+      lastExitSignal:null,
+      retryCount:0
     });
     void notifyTelegram(`▶️ Stream Harbor
 Slot ${id}: запуск потока
 Файл: ${sourceName}`);
   } else {
+    await updateSlotState(id, {
+      desired:"running",
+      mediaId:source.id,
+      streamId:streamId || null,
+      recoveredAt:new Date().toISOString(),
+      lastError:null,
+      retryCount:Number(retryCount || 0)
+    }).catch(() => {});
     void notifyTelegram(`♻️ Stream Harbor
 Slot ${id}: поток восстановлен после перезапуска
 Файл: ${sourceName}`);
@@ -1539,7 +1573,9 @@ async function stopSlot(slotId) {
   await updateSlotState(id, {
     desired:"stopped",
     streamId:null,
-    stoppedAt:new Date().toISOString()
+    stoppedAt:new Date().toISOString(),
+    lastError:null,
+    retryCount:0
   });
 
   const active = activeSlots.get(id);

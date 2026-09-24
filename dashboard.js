@@ -32,6 +32,14 @@ function isLive(s){
 }
 function getMedia(id){return state.media.find(m=>m.id===id)||null}
 function getCache(id){return state.cacheStatus[id]||{state:"not_cached",progressPct:0}}
+function normalizeChannelUrlInput(value){
+  let v=String(value||"").trim();
+  if(!v) return "";
+  if(/^rtmps?:\/\//i.test(v)) return "";
+  if(/^(?:www\.)?youtube\.com\//i.test(v) || /^youtu\.be\//i.test(v)) v="https://"+v;
+  return v;
+}
+
 function cacheButtonState(mediaId,live=false){
   const media=getMedia(mediaId);
   const cache=getCache(mediaId);
@@ -502,10 +510,14 @@ function wireStreams(){
 async function saveStream(card,id,silent=false){
   const stream=state.streams.find(s=>s.id===id);
   const live=isLive(stream);
+  const channelUrlInput=card.querySelector(".channelUrl");
+  const normalizedChannelUrl=normalizeChannelUrlInput(channelUrlInput.value);
+  if(normalizedChannelUrl!==channelUrlInput.value.trim()) channelUrlInput.value=normalizedChannelUrl;
+
   const body={
     name:card.querySelector(".name").value.trim(),
     description:card.querySelector(".description").value.trim(),
-    channelUrl:card.querySelector(".channelUrl").value.trim()
+    channelUrl:normalizedChannelUrl
   };
   if(!live){
     body.mediaId=card.querySelector(".mediaId").value||null;

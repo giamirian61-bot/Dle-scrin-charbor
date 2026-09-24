@@ -503,7 +503,7 @@ function updateCardMediaUi(card,media){
   }
 }
 
-async function waitForMediaFlow(streamId,timeoutMs=30_000){
+async function waitForMediaFlow(streamId,timeoutMs=90_000){
   const deadline=Date.now()+Math.max(3000,Number(timeoutMs||0));
   while(Date.now()<deadline){
     const payload=await api("/api/streams",{cache:"no-store"});
@@ -604,7 +604,7 @@ function wireStreams(){
         toast(cache.state==="cached"?"Starting from local cache…":"Caching video locally before stream…");
         await api("/api/streams/"+encodeURIComponent(id)+"/start",{method:"POST",body:"{}"});
         toast("Start accepted. Waiting for real media flow…");
-        const confirmed=await waitForMediaFlow(id,30_000);
+        const confirmed=await waitForMediaFlow(id,90_000);
         if(confirmed){
           toast("Stream LIVE ✓");
           celebrateStreamAction("start");
@@ -859,8 +859,10 @@ async function refreshRuntime(){
 function eventLabel(type){
   const map={
     server_start:"SERVER START",
+    stream_start_requested:"START REQUEST",
     stream_start:"START",
     stream_media_flow:"MEDIA FLOW",
+    stream_start_failed:"START FAILED",
     stream_stop:"STOP",
     stream_restore:"RESTORE",
     worker_exit:"WORKER EXIT",
@@ -869,9 +871,9 @@ function eventLabel(type){
   return map[type]||String(type||"EVENT").replaceAll("_"," ").toUpperCase();
 }
 function eventClass(type){
-  if(["worker_exit","stream_health_restart"].includes(type)) return "error";
+  if(["worker_exit","stream_health_restart","stream_start_failed"].includes(type)) return "error";
   if(["stream_restore"].includes(type)) return "warning";
-  if(["stream_start","stream_media_flow","server_start"].includes(type)) return "ok";
+  if(["stream_start_requested","stream_start","stream_media_flow","server_start"].includes(type)) return "ok";
   return "";
 }
 function renderEvents(){

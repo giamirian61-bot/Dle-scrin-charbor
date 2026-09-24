@@ -32,7 +32,7 @@ app.set("trust proxy", 1);
 const PORT = 3000;
 const PREPARE_THREADS = Math.min(4, Math.max(1, Number(process.env.PREPARE_THREADS || 2) || 2));
 const MEDIA_DIR = process.env.MEDIA_DIR || "/data/media";
-const STREAM_CACHE_DIR = process.env.STREAM_CACHE_DIR || "/tmp/stream-harbor-cache";
+const STREAM_CACHE_DIR = process.env.STREAM_CACHE_DIR || path.join(MEDIA_DIR, "stream-cache");
 const STREAM_CACHE_RESERVE_BYTES = Math.max(
   128 * 1024 * 1024,
   Number(process.env.STREAM_CACHE_RESERVE_BYTES || 256 * 1024 * 1024)
@@ -1429,7 +1429,7 @@ async function ensureBucketStreamCache(mediaId, objectKey, expectedSize, origina
   }
 }
 
-async function resolveStreamSource(mediaId, { preferRemoteRecovery=false } = {}) {
+async function resolveStreamSource(mediaId, { requireCached=false } = {}) {
   const id = path.basename(String(mediaId || ""));
   if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
 
@@ -1444,7 +1444,7 @@ async function resolveStreamSource(mediaId, { preferRemoteRecovery=false } = {})
       throw new Error("media_requires_preparation");
     }
 
-    if (preferRemoteRecovery) {
+    if (requireCached) {
       const cachePath = streamCacheKeyPath(id, effectiveKey);
       try {
         const st = await fs.stat(cachePath);
@@ -1460,20 +1460,9 @@ async function resolveStreamSource(mediaId, { preferRemoteRecovery=false } = {})
           };
         }
       } catch {}
-
-      const recoveryUrl = await createBucketReadUrl(effectiveKey, 21600);
-      void logEvent("stream_remote_recovery_source", {
-        mediaId:id,
-        sourceKind:"bucket_recovery"
-      });
-      return {
-        id,
-        streamPath:recoveryUrl,
-        streamProbe:effectiveProbe,
-        profile:effectiveProfile,
-        sourceKind:"bucket_recovery",
-        cacheHit:false
-      };
+      const err = new Error("stream_cache_missing_for_restore");
+      err.code = "STREAM_CACHE_MISSING_FOR_RESTORE";
+      throw err;
     }
 
     const cached = await ensureBucketStreamCache(
@@ -1613,7 +1602,7 @@ async function startStreamInternalUnlocked(slotId, mediaId, { restore=false, ret
   const effectiveStreamKey = streamKey || streamKeyForSlot(id);
   if (!effectiveStreamKey) throw new Error("slot_stream_key_not_configured");
 
-  const source = await resolveStreamSource(mediaId, { preferRemoteRecovery:Boolean(restore) });
+  const source = await resolveStreamSource(mediaId, { requireCached:Boolean(restore) });
   const sourceMeta = (await getBucketMedia(source.id)) || await readMeta(source.id).catch(() => null);
   const sourceName = sourceMeta?.originalName || source.id;
   const baseUrl = String(rtmpUrl || YOUTUBE_RTMPS_BASE).replace(/\/+$/, "");
@@ -1697,7 +1686,12 @@ async function startStreamInternalUnlocked(slotId, mediaId, { restore=false, ret
       code:code ?? null,
       signal:signal ?? null,
       mediaId:source.id,
-      intentional:Boolean(snapshot?.intentionalStop)
+      intentional:Boolean(snapshot?.intentionalStop),
+      sourceKind:snapshot?.sourceKind || source.sourceKind || null,
+      cacheHit:Boolean(snapshot?.cacheHit),
+      outTime:snapshot?.metrics?.outTime || null,
+      speed:snapshot?.metrics?.speed || null,
+      bitrate:snapshot?.metrics?.bitrate || null
     };
     console.log(JSON.stringify({ event:"worker_exit", ...exitEvent }));
     void logEvent("worker_exit", exitEvent);
@@ -4474,6 +4468,18 @@ Telegram: активен`);
 Slot ${slotId}: восстановлен после перезапуска сервера`);
       } catch (err) {
         const msg = String(err?.message || err);
+        if (msg === "stream_cache_missing_for_restore") {
+          console.error(JSON.stringify({
+            event:"stream_restore_cache_missing",
+            slotId,
+            mediaId:desired.mediaId,
+            cacheDir:STREAM_CACHE_DIR
+          }));
+          void logEvent("stream_restore_cache_missing", {
+            slotId,
+            mediaId:desired.mediaId
+          });
+        }
         if (msg === "media_requires_bitrate_optimization") {
           await updateSlotState(slotId, {
             desired:"stopped",

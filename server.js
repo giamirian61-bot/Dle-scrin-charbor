@@ -2136,22 +2136,23 @@ async function prepareBucketMedia(mediaId) {
 
   void (async () => {
     const parts = [];
-    const PART_BYTES = 8 * 1024 * 1024;
+    const PART_BYTES = 16 * 1024 * 1024;
+    const MAX_IN_FLIGHT_PARTS = 4;
     let buffers = [];
     let bufferedBytes = 0;
     let uploadedBytes = 0;
-    let partNumber = 1;
+    let nextPartNumber = 1;
+    const inFlight = new Set();
 
-    const uploadPreparedPart = async body => {
+    const uploadPreparedPart = async (body, assignedPartNumber) => {
       const result = await uploadMultipartPart({
         key:preparedKey,
         uploadId,
-        partNumber,
+        partNumber:assignedPartNumber,
         body
       });
       parts.push({ PartNumber:result.PartNumber, ETag:result.ETag });
       uploadedBytes += body.length;
-      partNumber += 1;
 
       const current = await getBucketMedia(id);
       if (current) {
@@ -2165,6 +2166,20 @@ async function prepareBucketMedia(mediaId) {
       }
     };
 
+    const schedulePreparedPart = body => {
+      const assignedPartNumber = nextPartNumber++;
+      let task;
+      task = uploadPreparedPart(body, assignedPartNumber)
+        .finally(() => inFlight.delete(task));
+      inFlight.add(task);
+      return task;
+    };
+
+    const waitForUploadCapacity = async () => {
+      if (inFlight.size < MAX_IN_FLIGHT_PARTS) return;
+      await Promise.race(inFlight);
+    };
+
     try {
       for await (const chunk of child.stdout) {
         buffers.push(chunk);
@@ -2172,17 +2187,22 @@ async function prepareBucketMedia(mediaId) {
 
         while (bufferedBytes >= PART_BYTES) {
           const all = Buffer.concat(buffers, bufferedBytes);
-          const body = all.subarray(0, PART_BYTES);
+          const body = Buffer.from(all.subarray(0, PART_BYTES));
           const rest = all.subarray(PART_BYTES);
-          buffers = rest.length ? [rest] : [];
+          buffers = rest.length ? [Buffer.from(rest)] : [];
           bufferedBytes = rest.length;
-          await uploadPreparedPart(body);
+          await waitForUploadCapacity();
+          schedulePreparedPart(body);
         }
       }
 
       if (bufferedBytes > 0) {
-        await uploadPreparedPart(Buffer.concat(buffers, bufferedBytes));
+        await waitForUploadCapacity();
+        schedulePreparedPart(Buffer.concat(buffers, bufferedBytes));
       }
+
+      await Promise.all(inFlight);
+      parts.sort((a,b) => a.PartNumber - b.PartNumber);
 
       const { code, signal } = await exitPromise;
       if (code !== 0) {

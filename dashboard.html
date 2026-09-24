@@ -41,7 +41,9 @@
       <section id="streamsView" class="view">
         <div class="toolbar">
           <button id="addStreamBtn" class="btn primary">＋ Add Stream</button>
-          <div class="hint"><span id="streamCount">0</span> streams</div>
+          <button id="refreshBtn" class="btn secondary">↻ Refresh</button>
+          <button id="stopAllBtn" class="btn danger">■ Stop All</button>
+          <div class="hint"><span id="streamCount">0</span>/<span id="slotCount">8</span> streams</div>
         </div>
         <div id="streamsGrid" class="streams-grid"></div>
       </section>
@@ -52,6 +54,9 @@
             ↑ Upload files
             <input id="fileInput" type="file" accept="video/mp4,video/quicktime,video/webm" hidden>
           </label>
+          <button id="pauseUploadBtn" class="btn secondary hidden">Ⅱ Pause upload</button>
+          <button id="cancelUploadBtn" class="btn danger hidden">× Cancel upload</button>
+          <button id="refreshStorageBtn" class="btn secondary">↻ Refresh</button>
           <div id="uploadState" class="hint">All uploaded videos live here and can be assigned to any stream.</div>
         </div>
         <div id="storageGrid" class="storage-grid"></div>

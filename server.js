@@ -660,7 +660,8 @@ function publicBucketMedia(item) {
     totalParts:Number(item.totalParts || 0),
     uploadedBytes:Number(item.uploadedBytes || 0),
     lastProgressAt:item.lastProgressAt || null,
-    stalledAt:item.stalledAt || null
+    stalledAt:item.stalledAt || null,
+    resumable:Boolean(item.uploadId && ["UPLOADING","STALLED","UPLOAD_PAUSED"].includes(item.status))
   };
 }
 
@@ -2022,6 +2023,74 @@ app.post("/api/bucket/multipart/start", requireOwner, async (req, res) => {
     return res.status(415).json({ error:"video_file_required" });
   }
 
+  // Resume an existing multipart session for the exact same local file.
+  // Browser re-selection is required for security, but already uploaded parts stay in Bucket.
+  const state = await readBucketMediaState();
+  const resumable = state.items
+    .filter(item =>
+      item?.uploadId &&
+      item.originalName === originalName &&
+      Number(item.size) === size &&
+      ["UPLOADING","STALLED","UPLOAD_PAUSED"].includes(item.status)
+    )
+    .sort((a,b) => Date.parse(b.updatedAt || b.createdAt || 0) - Date.parse(a.updatedAt || a.createdAt || 0))[0];
+
+  if (resumable) {
+    try {
+      const remote = await listMultipartParts({ key:resumable.key, uploadId:resumable.uploadId });
+      const completedParts = remote.parts
+        .filter(p => p.partNumber && p.etag)
+        .map(p => ({ PartNumber:p.partNumber, ETag:p.etag }))
+        .sort((a,b) => a.PartNumber - b.PartNumber);
+      const uploadedBytes = remote.parts.reduce((sum,p) => sum + Number(p.size || 0), 0);
+      const progressPct = size ? Math.min(100, (uploadedBytes / size) * 100) : 0;
+      const now = new Date().toISOString();
+
+      const resumed = await upsertBucketMedia({
+        ...resumable,
+        status:"UPLOADING",
+        error:null,
+        stalledAt:null,
+        uploadedParts:completedParts.length,
+        uploadedBytes,
+        progressPct,
+        lastProgressAt:resumable.lastProgressAt || now,
+        updatedAt:now
+      });
+
+      void notifyTelegram(`▶️ Stream Harbor
+Загрузка возобновлена
+Файл: ${originalName}
+Уже готово: ${completedParts.length}/${resumed.totalParts} частей
+Прогресс: ${Math.floor(progressPct)}%`);
+
+      return res.json({
+        id:resumed.id,
+        resumed:true,
+        partSize:Number(resumed.partSize || MULTIPART_PART_BYTES),
+        totalParts:Number(resumed.totalParts),
+        completedParts,
+        uploadedBytes,
+        progressPct,
+        maxBytes:MAX_BUCKET_FILE_BYTES
+      });
+    } catch (err) {
+      console.error(JSON.stringify({
+        event:"multipart_resume_probe_failed",
+        mediaId:resumable.id,
+        error:sanitizeLog(err?.message || err)
+      }));
+      // If the remote multipart session vanished, fall through and create a fresh one.
+      await upsertBucketMedia({
+        ...resumable,
+        uploadId:null,
+        status:"ERROR",
+        error:"resume_session_unavailable",
+        updatedAt:new Date().toISOString()
+      }).catch(() => {});
+    }
+  }
+
   const ext = path.extname(originalName).slice(0,10).replace(/[^.a-zA-Z0-9]/g,"") || ".mp4";
   const id = "bkt_" + crypto.randomUUID() + ext;
   const key = "media/" + id;
@@ -2053,12 +2122,17 @@ app.post("/api/bucket/multipart/start", requireOwner, async (req, res) => {
 Началась загрузка
 Файл: ${originalName}
 Размер: ${(size/1024/1024).toFixed(1)} MB
-Частей: ${totalParts}`);
+Частей: ${totalParts}
+Параллельных каналов: 3`);
 
   res.status(201).json({
     id,
+    resumed:false,
     partSize:MULTIPART_PART_BYTES,
     totalParts,
+    completedParts:[],
+    uploadedBytes:0,
+    progressPct:0,
     maxBytes:MAX_BUCKET_FILE_BYTES
   });
 });
@@ -2093,24 +2167,26 @@ app.post("/api/bucket/multipart/:id/progress", requireOwner, async (req, res) =>
     return res.status(409).json({ error:"multipart_upload_not_active" });
   }
 
-  const partNumber = Math.max(0, Number(req.body?.partNumber || 0));
-  const uploadedBytes = Math.max(0, Number(req.body?.uploadedBytes || 0));
-  const suppliedPct = Number(req.body?.progressPct);
-  const computedPct = item.size ? (uploadedBytes / Number(item.size)) * 100 : 0;
-  const progressPct = Math.max(0, Math.min(100,
-    Number.isFinite(suppliedPct) ? suppliedPct : computedPct
-  ));
   const wasStalled = item.status === "STALLED";
   const now = new Date().toISOString();
+
+  // Parallel uploads finish out of order, so never infer progress from part number.
+  // Ask the bucket which parts actually exist.
+  const remote = await listMultipartParts({ key:item.key, uploadId:item.uploadId });
+  const uploadedParts = remote.parts.length;
+  const uploadedBytes = remote.parts.reduce((sum,p) => sum + Number(p.size || 0), 0);
+  const progressPct = item.size
+    ? Math.max(0, Math.min(100, (uploadedBytes / Number(item.size)) * 100))
+    : 0;
 
   item = {
     ...item,
     status:"UPLOADING",
     error:null,
     stalledAt:null,
-    uploadedParts:Math.max(Number(item.uploadedParts || 0), partNumber),
-    uploadedBytes:Math.max(Number(item.uploadedBytes || 0), uploadedBytes),
-    progressPct:Math.max(Number(item.progressPct || 0), progressPct),
+    uploadedParts,
+    uploadedBytes,
+    progressPct,
     lastProgressAt:now,
     updatedAt:now
   };
@@ -2172,6 +2248,38 @@ app.post("/api/bucket/multipart/:id/complete", requireOwner, async (req, res) =>
 
   void analyzeBucketMedia(id);
   res.status(202).json({ ok:true, id, status:"ANALYZING" });
+});
+
+app.post("/api/bucket/multipart/:id/pause", requireOwner, async (req, res) => {
+  const id = path.basename(String(req.params.id || ""));
+  const item = await getBucketMedia(id);
+  if (!item) return res.status(404).json({ error:"bucket_media_not_found" });
+  if (!item.uploadId) return res.status(409).json({ error:"multipart_upload_not_active" });
+
+  const remote = await listMultipartParts({ key:item.key, uploadId:item.uploadId }).catch(() => ({parts:[]}));
+  const uploadedParts = remote.parts.length;
+  const uploadedBytes = remote.parts.reduce((sum,p) => sum + Number(p.size || 0), 0);
+  const progressPct = item.size ? Math.min(100, (uploadedBytes / Number(item.size)) * 100) : 0;
+  const now = new Date().toISOString();
+
+  await upsertBucketMedia({
+    ...item,
+    status:"UPLOAD_PAUSED",
+    uploadedParts,
+    uploadedBytes,
+    progressPct,
+    error:"upload_paused",
+    updatedAt:now
+  });
+
+  void notifyTelegram(`⏸ Stream Harbor
+Загрузка поставлена на паузу
+Файл: ${item.originalName || item.id}
+Сохранено: ${uploadedParts}/${item.totalParts || "?"} частей
+Прогресс: ${Math.floor(progressPct)}%
+Выбери тот же файл снова, чтобы продолжить.`);
+
+  res.json({ ok:true, status:"UPLOAD_PAUSED", uploadedParts, uploadedBytes, progressPct });
 });
 
 app.post("/api/bucket/multipart/:id/abort", requireOwner, async (req, res) => {

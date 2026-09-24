@@ -1,0 +1,10 @@
+services:
+  stream-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    env_file:
+      - .worker.env
+    volumes:
+      - /opt/stream-harbor-cache:/var/lib/stream-harbor-cache

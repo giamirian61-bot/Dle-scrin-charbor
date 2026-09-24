@@ -3243,7 +3243,13 @@ app.patch("/api/streams/:id", requireOwner, async (req, res) => {
 
   if (req.body?.name !== undefined) next.name = String(req.body.name || "").slice(0,120);
   if (req.body?.description !== undefined) next.description = String(req.body.description || "").slice(0,1000);
-  if (req.body?.channelUrl !== undefined) next.channelUrl = String(req.body.channelUrl || "").slice(0,500);
+  if (req.body?.channelUrl !== undefined) {
+    const value = String(req.body.channelUrl || "").trim().slice(0,500);
+    if (value && !/^https?:\/\//i.test(value)) {
+      return res.status(400).json({ error:"invalid_channel_url" });
+    }
+    next.channelUrl = value;
+  }
   if (req.body?.rtmpUrl !== undefined) {
     if (live && String(req.body.rtmpUrl || "").trim() !== String(current.rtmpUrl || YOUTUBE_RTMPS_BASE)) {
       return res.status(409).json({ error:"cannot_change_rtmp_while_live" });

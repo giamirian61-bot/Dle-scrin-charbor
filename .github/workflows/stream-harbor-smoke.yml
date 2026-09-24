@@ -4,9 +4,6 @@ on:
   push:
     branches:
       - dev-live-hardening
-  pull_request:
-    branches:
-      - main
 
 jobs:
   syntax:

@@ -1224,13 +1224,14 @@ let prepareJob = null;
 const prepareQueue = [];
 const queuedPrepareIds = new Set();
 
-const STREAM_HEALTH_CHECK_MS = 10_000;
-const STREAM_HEARTBEAT_STALE_MS = 30_000;
-const STREAM_METRICS_STALE_MS = 30_000;
+const STREAM_HEALTH_CHECK_MS = 5_000;
+const STREAM_HEARTBEAT_STALE_MS = 15_000;
+const STREAM_METRICS_STALE_MS = 15_000;
 const STREAM_LOW_SPEED_WARN = 0.90;
 const STREAM_LOW_SPEED_RESTART = 0.75;
 const STREAM_LOW_SPEED_RESTART_MS = 60_000;
-const STREAM_STARTUP_GRACE_MS = 45_000;
+const STREAM_STARTUP_GRACE_MS = 20_000;
+const STREAM_AUTO_RESTART_DELAY_MS = 1_000;
 
 function buildFfmpegArgs(filePath, profile, target) {
   const common = [
@@ -1727,7 +1728,7 @@ Slot ${id}: автоперезапуск не удался
 Ошибка: ${restartError}
 Слот переведён в STOPPED для безопасного ручного запуска после проверки.`);
         }
-      }, 10_000);
+      }, STREAM_AUTO_RESTART_DELAY_MS);
 
       restartTimers.set(id, timer);
     } else if (

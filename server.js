@@ -1504,20 +1504,42 @@ Slot ${id}: FFmpeg/worker завершился аварийно
             rtmpUrl:baseUrl
           });
         } catch (err) {
+          const restartError = sanitizeLog(err?.message || err);
+          await updateSlotState(id, {
+            desired:"stopped",
+            lastError:`auto_restart_failed: ${restartError}`,
+            stoppedAt:new Date().toISOString(),
+            retryCount:retryCount + 1
+          }).catch(() => {});
           console.error(JSON.stringify({
             event:"worker_auto_restart_failed",
             slotId:id,
             attempt:retryCount + 1,
-            error:sanitizeLog(err?.message || err)
+            error:restartError
           }));
           void notifyTelegram(`🚨 Stream Harbor
 Slot ${id}: автоперезапуск не удался
 Попытка: ${retryCount + 1}
-Ошибка: ${sanitizeLog(err?.message || err)}`);
+Ошибка: ${restartError}
+Слот переведён в STOPPED для безопасного ручного запуска после проверки.`);
         }
       }, 10_000);
 
       restartTimers.set(id, timer);
+    } else if (
+      desired.desired === "running" &&
+      desired.mediaId === source.id &&
+      retryCount >= 3
+    ) {
+      await updateSlotState(id, {
+        desired:"stopped",
+        lastError:"auto_restart_limit_exhausted",
+        stoppedAt:new Date().toISOString(),
+        retryCount
+      }).catch(() => {});
+      void notifyTelegram(`🚨 Stream Harbor
+Slot ${id}: лимит автоперезапусков исчерпан
+Слот остановлен. Требуется ручная проверка перед следующим запуском.`);
     }
   });
 

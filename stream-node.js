@@ -20,6 +20,11 @@ const CACHE_RESERVE_BYTES = Math.max(
 );
 const POLL_MS = Math.max(1000, Number(process.env.WORKER_POLL_MS || 3000));
 const STATUS_MS = Math.max(2000, Number(process.env.WORKER_STATUS_MS || 5000));
+const WATCHDOG_MS = Math.max(1000, Number(process.env.WORKER_WATCHDOG_MS || 5000));
+const HEARTBEAT_STALE_MS = Math.max(10_000, Number(process.env.WORKER_HEARTBEAT_STALE_MS || 15_000));
+const METRICS_STALE_MS = Math.max(10_000, Number(process.env.WORKER_METRICS_STALE_MS || 15_000));
+const STARTUP_GRACE_MS = Math.max(10_000, Number(process.env.WORKER_STARTUP_GRACE_MS || 20_000));
+const AUTO_RESTART_DELAY_MS = Math.max(250, Number(process.env.WORKER_AUTO_RESTART_DELAY_MS || 1000));
 
 if (!CONTROLLER_URL || !WORKER_AGENT_TOKEN) {
   console.error("CONTROLLER_URL and WORKER_AGENT_TOKEN are required");
@@ -227,7 +232,7 @@ async function startSlot(spec) {
       if(wanted?.desired==="running"){
         startSlot(wanted).catch(err=>console.error("restart",slotId,String(err?.message||err)));
       }
-    },5000).unref();
+    },AUTO_RESTART_DELAY_MS).unref();
 
     console.error(JSON.stringify({event:"worker_exit",slotId,code,signal}));
   });
@@ -291,6 +296,32 @@ setInterval(async()=>{
   try{await reconcile()}catch(err){console.error("reconcile",String(err?.message||err))}
   finally{reconciling=false}
 },POLL_MS).unref();
+
+setInterval(()=>{
+  const now=Date.now();
+  for(const [slotId,current] of active){
+    if(current.intentionalStop || current.healthState==="stopping") continue;
+
+    const startedMs=Date.parse(current.startedAt||0);
+    if(!startedMs || now-startedMs<STARTUP_GRACE_MS) continue;
+
+    const heartbeatMs=Date.parse(current.lastHeartbeatAt||0);
+    const metricMs=Date.parse(current.lastMetricAt||0);
+    const heartbeatStale=!heartbeatMs || now-heartbeatMs>HEARTBEAT_STALE_MS;
+    const metricsStale=!metricMs || now-metricMs>METRICS_STALE_MS;
+
+    if(!heartbeatStale && !metricsStale) continue;
+
+    current.healthState="stalled";
+    current.lastError=heartbeatStale?"worker_heartbeat_stale":"ffmpeg_metrics_stale";
+    console.error(JSON.stringify({
+      event:"worker_watchdog_restart",
+      slotId,
+      reason:current.lastError
+    }));
+    stopSlot(slotId,false);
+  }
+},WATCHDOG_MS).unref();
 
 setInterval(()=>{
   reportStatus().catch(err=>console.error("status",String(err?.message||err)));

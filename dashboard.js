@@ -405,7 +405,7 @@ q("#fileInput").addEventListener("change",async e=>{
   try{
     const prep=await api("/api/bucket/multipart/start",{
       method:"POST",
-      body:JSON.stringify({name:f.name,size:f.size,type:f.type||"video/mp4"})
+      body:JSON.stringify({name:f.name,size:f.size,type:f.type||"video/mp4",lastModified:f.lastModified||0})
     });
     mediaId=prep.id;
     await refreshStorageOnly().catch(()=>{});

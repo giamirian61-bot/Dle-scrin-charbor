@@ -36,6 +36,10 @@ const STREAM_CACHE_RESERVE_BYTES = Math.max(
   128 * 1024 * 1024,
   Number(process.env.STREAM_CACHE_RESERVE_BYTES || 256 * 1024 * 1024)
 );
+const STREAM_CACHE_QUOTA_BYTES = Math.max(
+  1024 * 1024 * 1024,
+  Number(process.env.STREAM_CACHE_QUOTA_BYTES || 100 * 1024 * 1024 * 1024)
+);
 const OWNER_TOKEN = process.env.OWNER_TOKEN || "";
 const YOUTUBE_STREAM_KEY = process.env.YOUTUBE_STREAM_KEY || "";
 const YOUTUBE_RTMPS_BASE = process.env.YOUTUBE_RTMPS_BASE || "rtmps://a.rtmps.youtube.com/live2";
@@ -955,9 +959,26 @@ async function streamCacheDiskInfo() {
   await fs.mkdir(STREAM_CACHE_DIR, { recursive:true });
   const stat = await fs.statfs(STREAM_CACHE_DIR);
   const blockSize = Number(stat.bsize || stat.frsize || 4096);
+  const rawTotalBytes = Number(stat.blocks || 0) * blockSize;
+  const rawAvailableBytes = Number(stat.bavail || stat.bfree || 0) * blockSize;
+
+  const entries = await fs.readdir(STREAM_CACHE_DIR, { withFileTypes:true }).catch(() => []);
+  let cacheUsedBytes = 0;
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    try {
+      const st = await fs.stat(path.join(STREAM_CACHE_DIR, entry.name));
+      cacheUsedBytes += Number(st.size || 0);
+    } catch {}
+  }
+
+  const quotaAvailableBytes = Math.max(0, STREAM_CACHE_QUOTA_BYTES - cacheUsedBytes);
   return {
-    totalBytes:Number(stat.blocks || 0) * blockSize,
-    availableBytes:Number(stat.bavail || stat.bfree || 0) * blockSize
+    totalBytes:Math.min(rawTotalBytes, STREAM_CACHE_QUOTA_BYTES),
+    availableBytes:Math.min(rawAvailableBytes, quotaAvailableBytes),
+    rawAvailableBytes,
+    quotaBytes:STREAM_CACHE_QUOTA_BYTES,
+    cacheUsedBytes
   };
 }
 
@@ -3171,6 +3192,8 @@ const server = app.listen(PORT, "0.0.0.0", () => {
       dir:STREAM_CACHE_DIR,
       totalBytes:info.totalBytes,
       availableBytes:info.availableBytes,
+      quotaBytes:info.quotaBytes,
+      cacheUsedBytes:info.cacheUsedBytes,
       reserveBytes:STREAM_CACHE_RESERVE_BYTES
     })))
     .catch(err => console.error(JSON.stringify({

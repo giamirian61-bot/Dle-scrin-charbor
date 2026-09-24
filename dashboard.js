@@ -5,7 +5,9 @@ const state={
   cacheStatus:{},
   slotCount:8,
   activeUpload:null,
-  events:[]
+  events:[],
+  pendingStarts:new Set(),
+  pendingStops:new Set()
 };
 
 function q(s){return document.querySelector(s)}
@@ -107,7 +109,7 @@ function celebrateStreamAction(kind){
   try{
     playCelebrationTone(kind);
     const text=kind==="stop"
-      ?"Ты стал немножечко популярнее и богаче!"
+      ?"Ты стал немножечко популярнее и богат!"
       :"Ты на пути успеха!";
     setTimeout(()=>speakCelebration(text),kind==="stop"?650:700);
   }catch{}
@@ -124,7 +126,7 @@ async function api(url,opts={}){
 }
 
 function isLive(s){
-  return ["live_or_starting","restarting","recovering","stopping"].includes(s?.runtime?.state);
+  return ["starting","live_or_starting","restarting","recovering","stopping"].includes(s?.runtime?.state);
 }
 function getMedia(id){return state.media.find(m=>m.id===id)||null}
 function getCache(id){return state.cacheStatus[id]||{state:"not_cached",progressPct:0}}
@@ -155,6 +157,7 @@ function badgeInfo(s){
   const runtime=s?.runtime||{};
   const st=runtime.state||"idle";
   const health=runtime.health?.state||"";
+  if(st==="starting") return {text:"STARTING",klass:"warning"};
   if(st==="restarting") return {text:"RESTARTING",klass:"warning"};
   if(st==="recovering") return {text:"RECOVERING",klass:"warning"};
   if(st==="live_or_starting"){
@@ -178,6 +181,7 @@ function runtimeLine(runtime={}){
     +(runtime.metrics?.speed?" · "+runtime.metrics.speed:"")
     +(up?" · Up "+up:"")
     +(hb!=null?" · HB "+hb+"s":"")
+    +(runtime.health?.mediaFlowConfirmed?" · FLOW ✓":"")
     +(retry?" · Retry "+retry:"")
     +(runtime.lastError?" · "+runtime.lastError:"");
 }
@@ -499,6 +503,31 @@ function updateCardMediaUi(card,media){
   }
 }
 
+async function waitForMediaFlow(streamId,timeoutMs=30_000){
+  const deadline=Date.now()+Math.max(3000,Number(timeoutMs||0));
+  while(Date.now()<deadline){
+    const payload=await api("/api/streams",{cache:"no-store"});
+    const item=(payload.items||[]).find(x=>x.id===streamId);
+    const runtime=item?.runtime||{};
+    if(runtime.health?.mediaFlowConfirmed && runtime.health?.state==="healthy") return item;
+    if(runtime.lastError || ["idle","stopping"].includes(runtime.state)) return null;
+    await new Promise(r=>setTimeout(r,1000));
+  }
+  return null;
+}
+
+async function waitForStreamStopped(streamId,timeoutMs=15_000){
+  const deadline=Date.now()+Math.max(3000,Number(timeoutMs||0));
+  while(Date.now()<deadline){
+    const payload=await api("/api/streams",{cache:"no-store"});
+    const item=(payload.items||[]).find(x=>x.id===streamId);
+    const runtime=item?.runtime||{};
+    if(!item || runtime.state==="idle") return true;
+    await new Promise(r=>setTimeout(r,500));
+  }
+  return false;
+}
+
 function wireStreams(){
   document.querySelectorAll(".stream-card").forEach(card=>{
     const id=card.dataset.id;
@@ -563,6 +592,8 @@ function wireStreams(){
 
     card.querySelector(".startBtn")?.addEventListener("click",async()=>{
       primeCelebrationAudio();
+      if(state.pendingStarts.has(id)) return;
+      state.pendingStarts.add(id);
       const btn=card.querySelector(".startBtn");
       try{
         btn.disabled=true;
@@ -571,12 +602,19 @@ function wireStreams(){
         const mediaId=card.querySelector(".mediaId")?.value||"";
         const cache=getCache(mediaId);
         toast(cache.state==="cached"?"Starting from local cache…":"Caching video locally before stream…");
-        const started=await api("/api/streams/"+encodeURIComponent(id)+"/start",{method:"POST",body:"{}"});
-        toast(started.cacheHit?"Stream started from local cache":"Stream start requested");
-        celebrateStreamAction("start");
-        setTimeout(loadAll,900);
+        await api("/api/streams/"+encodeURIComponent(id)+"/start",{method:"POST",body:"{}"});
+        toast("Start accepted. Waiting for real media flow…");
+        const confirmed=await waitForMediaFlow(id,30_000);
+        if(confirmed){
+          toast("Stream LIVE ✓");
+          celebrateStreamAction("start");
+        }else{
+          toast("Start sent, but media flow is not confirmed yet",true);
+        }
       }catch(e){
         toast(e.message,true);
+      }finally{
+        state.pendingStarts.delete(id);
         setTimeout(loadAll,500);
       }
     });
@@ -599,13 +637,25 @@ function wireStreams(){
     card.querySelector(".stopBtn")?.addEventListener("click",async()=>{
       if(!confirm("Stop this stream?")) return;
       primeCelebrationAudio();
+      if(state.pendingStops.has(id)) return;
+      state.pendingStops.add(id);
       try{
         card.querySelector(".stopBtn").disabled=true;
         await api("/api/streams/"+encodeURIComponent(id)+"/stop",{method:"POST",body:"{}"});
-        toast("Stream stop requested");
-        celebrateStreamAction("stop");
-        setTimeout(loadAll,900);
-      }catch(e){toast(e.message,true)}
+        toast("Stopping stream…");
+        const stopped=await waitForStreamStopped(id,15_000);
+        if(stopped){
+          toast("Stream stopped ✓");
+          celebrateStreamAction("stop");
+        }else{
+          toast("Stop requested, worker is still shutting down",true);
+        }
+      }catch(e){
+        toast(e.message,true);
+      }finally{
+        state.pendingStops.delete(id);
+        setTimeout(loadAll,500);
+      }
     });
 
     card.querySelector(".openChannelBtn")?.addEventListener("click",()=>{
@@ -761,7 +811,8 @@ async function refreshRuntime(){
       if(status) status.textContent=runtimeLine(incoming.runtime||{});
 
       const live=isLive(incoming);
-      const stopping=incoming.runtime?.state==="stopping";
+      const starting=incoming.runtime?.state==="starting" || state.pendingStarts.has(incoming.id);
+      const stopping=incoming.runtime?.state==="stopping" || state.pendingStops.has(incoming.id);
       const mediaSelect=card.querySelector(".mediaId");
       const mediaId=mediaSelect?.value||null;
       const selectedMedia=getMedia(mediaId);
@@ -775,14 +826,14 @@ async function refreshRuntime(){
       const cacheBtn=card.querySelector(".cacheSelectedBtn");
 
       if(startBtn){
-        startBtn.textContent="▶ Start";
-        startBtn.disabled=live||!incoming.keyConfigured||!mediaId||selectedMedia?.status!=="READY_DIRECT";
+        startBtn.textContent=starting?"Starting…":"▶ Start";
+        startBtn.disabled=live||starting||!incoming.keyConfigured||!mediaId||selectedMedia?.status!=="READY_DIRECT";
       }
       if(restartBtn){
         restartBtn.textContent="↻ Restart";
-        restartBtn.disabled=!live||stopping;
+        restartBtn.disabled=!live||starting||stopping;
       }
-      if(stopBtn) stopBtn.disabled=!live||stopping;
+      if(stopBtn) stopBtn.disabled=!live||starting||stopping;
       if(deleteBtn) deleteBtn.disabled=live;
       if(mediaSelect) mediaSelect.disabled=live;
       if(keyInput) keyInput.disabled=live;
@@ -809,6 +860,7 @@ function eventLabel(type){
   const map={
     server_start:"SERVER START",
     stream_start:"START",
+    stream_media_flow:"MEDIA FLOW",
     stream_stop:"STOP",
     stream_restore:"RESTORE",
     worker_exit:"WORKER EXIT",
@@ -819,7 +871,7 @@ function eventLabel(type){
 function eventClass(type){
   if(["worker_exit","stream_health_restart"].includes(type)) return "error";
   if(["stream_restore"].includes(type)) return "warning";
-  if(["stream_start","server_start"].includes(type)) return "ok";
+  if(["stream_start","stream_media_flow","server_start"].includes(type)) return "ok";
   return "";
 }
 function renderEvents(){

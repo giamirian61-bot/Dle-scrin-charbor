@@ -265,6 +265,7 @@ function streamCard(s){
       <button class="btn secondary saveBtn">Save</button>
       <button class="btn primary startBtn" ${live||!s.keyConfigured||!s.mediaId||media?.status!=="READY_DIRECT"?"disabled":""}>▶ Start</button>
       <button class="btn warning restartBtn" ${!live||runtime.state==="stopping"?"disabled":""}>↻ Restart</button>
+      <button class="btn warning crashTestBtn" ${!live||runtime.state==="stopping"?"disabled":""}>⚠ Crash test</button>
       <button class="btn danger stopBtn" ${!live||runtime.state==="stopping"?"disabled":""}>■ Stop</button>
       ${channelUrl?'<button class="btn secondary openChannelBtn">Open channel</button>':""}
       <span class="spacer"></span>
@@ -634,6 +635,24 @@ function wireStreams(){
       }
     });
 
+    card.querySelector(".crashTestBtn")?.addEventListener("click",async()=>{
+      if(!confirm("Crash-test only this worker? The slot will remain desired RUNNING and should auto-recover.")) return;
+      const btn=card.querySelector(".crashTestBtn");
+      try{
+        btn.disabled=true;
+        btn.textContent="Crashing…";
+        await api("/api/streams/"+encodeURIComponent(id)+"/crash-worker-test",{
+          method:"POST",
+          body:JSON.stringify({confirm:"CRASH_WORKER_TEST"})
+        });
+        toast("Worker crash test started. Watching auto-recovery…");
+        setTimeout(loadAll,1200);
+      }catch(e){
+        toast(e.message,true);
+        setTimeout(loadAll,500);
+      }
+    });
+
     card.querySelector(".stopBtn")?.addEventListener("click",async()=>{
       if(!confirm("Stop this stream?")) return;
       primeCelebrationAudio();
@@ -819,6 +838,7 @@ async function refreshRuntime(){
 
       const startBtn=card.querySelector(".startBtn");
       const restartBtn=card.querySelector(".restartBtn");
+      const crashTestBtn=card.querySelector(".crashTestBtn");
       const stopBtn=card.querySelector(".stopBtn");
       const deleteBtn=card.querySelector(".deleteBtn");
       const keyInput=card.querySelector(".streamKey");
@@ -832,6 +852,10 @@ async function refreshRuntime(){
       if(restartBtn){
         restartBtn.textContent="↻ Restart";
         restartBtn.disabled=!live||starting||stopping;
+      }
+      if(crashTestBtn){
+        crashTestBtn.textContent="⚠ Crash test";
+        crashTestBtn.disabled=!live||starting||stopping;
       }
       if(stopBtn) stopBtn.disabled=!live||starting||stopping;
       if(deleteBtn) deleteBtn.disabled=live;
@@ -866,12 +890,13 @@ function eventLabel(type){
     stream_stop:"STOP",
     stream_restore:"RESTORE",
     worker_exit:"WORKER EXIT",
-    stream_health_restart:"HEALTH RESTART"
+    stream_health_restart:"HEALTH RESTART",
+    stream_crash_test:"CRASH TEST"
   };
   return map[type]||String(type||"EVENT").replaceAll("_"," ").toUpperCase();
 }
 function eventClass(type){
-  if(["worker_exit","stream_health_restart","stream_start_failed"].includes(type)) return "error";
+  if(["worker_exit","stream_health_restart","stream_start_failed","stream_crash_test"].includes(type)) return "error";
   if(["stream_restore"].includes(type)) return "warning";
   if(["stream_start_requested","stream_start","stream_media_flow","server_start"].includes(type)) return "ok";
   return "";

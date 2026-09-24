@@ -3828,6 +3828,62 @@ Slot ${slotId}: запуск не удался
   }
 });
 
+app.post("/api/streams/:id/crash-worker-test", requireOwner, async (req, res) => {
+  try {
+    if (STREAM_EXECUTION_MODE !== "local") {
+      return res.status(409).json({ error:"crash_test_local_only" });
+    }
+    if (req.body?.confirm !== "CRASH_WORKER_TEST") {
+      return res.status(400).json({ error:"crash_test_confirmation_required" });
+    }
+
+    const item = await getStreamConfig(req.params.id);
+    if (!item) return res.status(404).json({ error:"stream_not_found" });
+
+    const slotId = String(item.slotId);
+    const active = activeSlots.get(slotId);
+    if (!active) return res.status(409).json({ error:"stream_not_running" });
+    if (active.intentionalStop || active.healthRestarting) {
+      return res.status(409).json({ error:"stream_not_testable" });
+    }
+
+    const state = await readSlotsState();
+    const desired = state.slots?.[slotId] || { desired:"stopped" };
+    if (desired.desired !== "running" || desired.mediaId !== active.file) {
+      return res.status(409).json({ error:"stream_not_desired_running" });
+    }
+
+    const testEvent = {
+      slotId,
+      streamId:item.id,
+      mediaId:active.file,
+      pid:active.pid
+    };
+    console.warn(JSON.stringify({ event:"stream_crash_test", ...testEvent }));
+    void logEvent("stream_crash_test", testEvent);
+
+    try { active.worker.kill("SIGTERM"); }
+    catch (err) { return res.status(500).json({ error:"worker_signal_failed" }); }
+
+    setTimeout(() => {
+      const current = activeSlots.get(slotId);
+      if (current?.pid === active.pid) {
+        try { current.worker.kill("SIGKILL"); } catch {}
+      }
+    }, 2500).unref();
+
+    return res.status(202).json({
+      ok:true,
+      accepted:true,
+      state:"crash_test_started",
+      slotId
+    });
+  } catch (err) {
+    const msg = String(err?.message || err);
+    return res.status(streamErrorStatus(msg)).json({ error:msg });
+  }
+});
+
 app.post("/api/streams/:id/restart", requireOwner, async (req, res) => {
   try {
     const item = await getStreamConfig(req.params.id);

@@ -4,12 +4,24 @@ const state={
   view:"streams",
   cacheStatus:{},
   slotCount:8,
-  activeUpload:null
+  activeUpload:null,
+  events:[]
 };
 
 function q(s){return document.querySelector(s)}
 function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function fmtMb(n){return ((Number(n||0))/1024/1024).toFixed(1)+" MB"}
+function fmtDuration(ms){
+  const total=Math.max(0,Math.floor(Number(ms||0)/1000));
+  const h=Math.floor(total/3600);
+  const m=Math.floor((total%3600)/60);
+  const s=total%60;
+  return (h?String(h).padStart(2,"0")+":":"")+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0");
+}
+function ageSeconds(iso){
+  const t=Date.parse(iso||"");
+  return Number.isFinite(t)?Math.max(0,Math.round((Date.now()-t)/1000)):null;
+}
 function toast(msg,error=false){
   const el=q("#toast");
   el.textContent=msg;
@@ -28,7 +40,7 @@ async function api(url,opts={}){
 }
 
 function isLive(s){
-  return s?.runtime?.state==="live_or_starting" || s?.runtime?.state==="stopping";
+  return ["live_or_starting","restarting","recovering","stopping"].includes(s?.runtime?.state);
 }
 function getMedia(id){return state.media.find(m=>m.id===id)||null}
 function getCache(id){return state.cacheStatus[id]||{state:"not_cached",progressPct:0}}
@@ -59,9 +71,12 @@ function badgeInfo(s){
   const runtime=s?.runtime||{};
   const st=runtime.state||"idle";
   const health=runtime.health?.state||"";
+  if(st==="restarting") return {text:"RESTARTING",klass:"warning"};
+  if(st==="recovering") return {text:"RECOVERING",klass:"warning"};
   if(st==="live_or_starting"){
     if(["stalled","worker_offline","unassigned"].includes(health)) return {text:"ERROR",klass:"error"};
-    if(["warning","waiting_worker","restarting"].includes(health)) return {text:"DEGRADED",klass:"warning"};
+    if(["warning","waiting_worker","restarting","recovering"].includes(health)) return {text:"DEGRADED",klass:"warning"};
+    if(health==="starting") return {text:"STARTING",klass:"warning"};
     return {text:"LIVE",klass:"live"};
   }
   if(st==="stopping") return {text:"STOPPING",klass:"warning"};
@@ -69,11 +84,17 @@ function badgeInfo(s){
   return {text:st.toUpperCase(),klass:""};
 }
 function runtimeLine(runtime={}){
+  const up=runtime.startedAt?fmtDuration(Date.now()-Date.parse(runtime.startedAt)):"";
+  const hb=ageSeconds(runtime.health?.lastHeartbeatAt);
+  const retry=Number(runtime.health?.retryCount||0);
   return "Worker: "+(runtime.state||"idle")
     +(runtime.health?.state?" · Health: "+runtime.health.state:"")
     +(runtime.sourceKind?" · Source: "+runtime.sourceKind:"")
     +(runtime.metrics?.bitrate?" · "+runtime.metrics.bitrate:"")
     +(runtime.metrics?.speed?" · "+runtime.metrics.speed:"")
+    +(up?" · Up "+up:"")
+    +(hb!=null?" · HB "+hb+"s":"")
+    +(retry?" · Retry "+retry:"")
     +(runtime.lastError?" · "+runtime.lastError:"");
 }
 
@@ -81,8 +102,10 @@ function setView(view){
   state.view=view;
   q("#streamsView").classList.toggle("hidden",view!=="streams");
   q("#storageView").classList.toggle("hidden",view!=="storage");
-  q("#pageTitle").textContent=view==="streams"?"My streams":"Storage";
+  q("#eventsView").classList.toggle("hidden",view!=="events");
+  q("#pageTitle").textContent=view==="streams"?"My streams":view==="storage"?"Storage":"Events";
   document.querySelectorAll(".nav-item").forEach(b=>b.classList.toggle("active",b.dataset.view===view));
+  if(view==="events") loadEvents().catch(()=>{});
 }
 
 function mediaOptions(selected){
@@ -163,7 +186,7 @@ function streamCard(s){
 }
 
 function renderStreams(){
-  q("#streamCount").textContent=state.streams.length;
+  q("#streamCount").textContent=state.streams.filter(isLive).length;
   q("#slotCount").textContent=state.slotCount;
   q("#addStreamBtn").disabled=state.streams.length>=state.slotCount;
   q("#stopAllBtn").disabled=!state.streams.some(isLive);
@@ -617,8 +640,15 @@ async function pollPrepareQueue(){
 
 async function refreshRuntime(){
   try{
-    const s=await api("/api/streams");
+    const [s,h]=await Promise.all([
+      api("/api/streams"),
+      fetch("/health",{cache:"no-store"}).then(r=>r.json())
+    ]);
     const fresh=s.items||[];
+    q("#serverStatus").textContent=h.ok
+      ?"Server online · "+Number(h.streamingSlots||0)+" active"
+      :"Server problem";
+    q("#streamCount").textContent=fresh.filter(isLive).length;
 
     for(const incoming of fresh){
       const current=state.streams.find(x=>x.id===incoming.id);
@@ -687,6 +717,46 @@ async function refreshRuntime(){
   }
 }
 
+function eventLabel(type){
+  const map={
+    server_start:"SERVER START",
+    stream_start:"START",
+    stream_stop:"STOP",
+    stream_restore:"RESTORE",
+    worker_exit:"WORKER EXIT",
+    stream_health_restart:"HEALTH RESTART"
+  };
+  return map[type]||String(type||"EVENT").replaceAll("_"," ").toUpperCase();
+}
+function eventClass(type){
+  if(["worker_exit","stream_health_restart"].includes(type)) return "error";
+  if(["stream_restore"].includes(type)) return "warning";
+  if(["stream_start","server_start"].includes(type)) return "ok";
+  return "";
+}
+function renderEvents(){
+  const el=q("#eventsList");
+  if(!el) return;
+  el.innerHTML=state.events.length?state.events.map(e=>{
+    const details=Object.entries(e)
+      .filter(([k])=>!["ts","type"].includes(k))
+      .map(([k,v])=>k+": "+(v==null?"-":typeof v==="object"?JSON.stringify(v):String(v)))
+      .join(" · ");
+    return `<article class="event-row">
+      <div class="event-time">${esc(e.ts?new Date(e.ts).toLocaleString():"-")}</div>
+      <div class="event-main">
+        <span class="event-badge ${esc(eventClass(e.type))}">${esc(eventLabel(e.type))}</span>
+        <div class="event-details">${esc(details||"")}</div>
+      </div>
+    </article>`;
+  }).join(""):'<div class="empty">Пока событий нет.</div>';
+}
+async function loadEvents(){
+  const r=await api("/api/events?limit=200",{cache:"no-store"});
+  state.events=r.items||[];
+  renderEvents();
+}
+
 async function loadAll(){
   try{
     const [s,m,h]=await Promise.all([
@@ -697,7 +767,9 @@ async function loadAll(){
     state.streams=s.items||[];
     state.media=m.items||[];
     state.slotCount=Math.max(1,Number(h.slotCount||8));
-    q("#serverStatus").textContent=h.ok?"Server online":"Server problem";
+    q("#serverStatus").textContent=h.ok
+      ?"Server online · "+Number(h.streamingSlots||0)+" active"
+      :"Server problem";
     await refreshCacheStatuses();
     renderStreams();
     renderStorage();
@@ -732,6 +804,7 @@ q("#addStreamBtn").addEventListener("click",async()=>{
 
 q("#refreshBtn").addEventListener("click",()=>loadAll());
 q("#refreshStorageBtn").addEventListener("click",()=>refreshStorageOnly());
+q("#refreshEventsBtn").addEventListener("click",()=>loadEvents().catch(e=>toast(e.message,true)));
 
 q("#stopAllBtn").addEventListener("click",async()=>{
   if(!confirm("STOP ALL active streams?")) return;
@@ -957,4 +1030,9 @@ setInterval(()=>{
   if(!q("#storageView").classList.contains("hidden")){
     refreshStorageOnly().catch(()=>{});
   }
-},5000);
+},15000);
+setInterval(()=>{
+  if(!q("#eventsView").classList.contains("hidden")){
+    loadEvents().catch(()=>{});
+  }
+},10000);

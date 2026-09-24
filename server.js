@@ -73,6 +73,9 @@ const BUCKET_MEDIA_FILE = path.join(MEDIA_DIR, ".bucket-media.json");
 const LEGACY_STATE_FILE = path.join(MEDIA_DIR, ".stream-state.json");
 const SLOT_STATE_FILE = path.join(MEDIA_DIR, ".slots-state.json");
 const STREAM_CONFIGS_FILE = path.join(MEDIA_DIR, ".stream-configs.json");
+const EVENT_LOG_FILE = path.join(MEDIA_DIR, ".stream-events.jsonl");
+const EVENT_LOG_ARCHIVE_FILE = path.join(MEDIA_DIR, ".stream-events.1.jsonl");
+const MAX_EVENT_LOG_BYTES = 5 * 1024 * 1024;
 
 await fs.mkdir(MEDIA_DIR, { recursive: true });
 
@@ -165,6 +168,49 @@ function sanitizeLog(value) {
   // Never persist temporary signed URLs or query credentials in logs/state/Telegram.
   s = s.replace(/(https?:\/\/[^\s?]+)\?[^\s]*/gi, "$1?[REDACTED_QUERY]");
   return s;
+}
+
+async function logEvent(type, data={}) {
+  try {
+    const record = sanitizeLog(JSON.stringify({
+      ts:new Date().toISOString(),
+      type:String(type || "event").slice(0,80),
+      ...data
+    })) + "\n";
+
+    try {
+      const st = await fs.stat(EVENT_LOG_FILE);
+      if (Number(st.size || 0) >= MAX_EVENT_LOG_BYTES) {
+        await fs.unlink(EVENT_LOG_ARCHIVE_FILE).catch(() => {});
+        await fs.rename(EVENT_LOG_FILE, EVENT_LOG_ARCHIVE_FILE).catch(() => {});
+      }
+    } catch {}
+
+    await fs.appendFile(EVENT_LOG_FILE, record, "utf8");
+  } catch (err) {
+    console.error(JSON.stringify({
+      event:"event_log_write_failed",
+      error:sanitizeLog(err?.message || err)
+    }));
+  }
+}
+
+async function readEvents(limit=100) {
+  const n = Math.max(1, Math.min(500, Number(limit || 100)));
+  try {
+    const raw = await fs.readFile(EVENT_LOG_FILE, "utf8");
+    return raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .slice(-n)
+      .reverse()
+      .map(line => {
+        try { return JSON.parse(sanitizeLog(line)); }
+        catch { return { ts:null, type:"invalid_event", detail:sanitizeLog(line).slice(0,500) }; }
+      });
+  } catch {
+    return [];
+  }
 }
 
 function telegramConfigured() {
@@ -1332,13 +1378,24 @@ function slotStatusPayload(slotId, desiredState=null) {
   const desired = desiredState || null;
 
   if (!active) {
+    const restartPending = restartTimers.has(id);
+    const wantsRunning = desired?.desired === "running";
+    const state = restartPending ? "restarting" : wantsRunning ? "recovering" : "idle";
     return {
       slotId:id,
-      state:"idle",
+      state,
       desired:desired?.desired || "stopped",
       mediaId:desired?.mediaId || null,
       streamId:desired?.streamId || null,
-      keyConfigured:Boolean(streamKeyForSlot(id))
+      keyConfigured:Boolean(streamKeyForSlot(id)),
+      startedAt:null,
+      metrics:{},
+      health:{
+        state:restartPending ? "restarting" : wantsRunning ? "recovering" : "idle",
+        retryCount:Number(desired?.retryCount || 0),
+        lastExitAt:desired?.lastExitAt || null
+      },
+      lastError:desired?.lastError || null
     };
   }
 
@@ -1371,6 +1428,7 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
   const id = String(slotId);
   if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
   if (activeSlots.has(id)) throw new Error("stream_already_active");
+  if (restartTimers.has(id)) throw new Error("stream_restart_pending");
 
   const effectiveStreamKey = streamKey || streamKeyForSlot(id);
   if (!effectiveStreamKey) throw new Error("slot_stream_key_not_configured");
@@ -1444,16 +1502,26 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
     const snapshot = activeSlots.get(id);
     if (snapshot?.pid === worker.pid) activeSlots.delete(id);
 
-    console.log(JSON.stringify({
-      event:"worker_exit",
+    const exitEvent = {
       slotId:id,
-      code,
-      signal,
+      code:code ?? null,
+      signal:signal ?? null,
       mediaId:source.id,
       intentional:Boolean(snapshot?.intentionalStop)
-    }));
+    };
+    console.log(JSON.stringify({ event:"worker_exit", ...exitEvent }));
+    void logEvent("worker_exit", exitEvent);
 
     if (snapshot?.intentionalStop) return;
+
+    const exitError = snapshot?.lastError || `worker_exit code=${code ?? "null"} signal=${signal ?? "null"}`;
+    await updateSlotState(id, {
+      lastError:sanitizeLog(exitError),
+      lastExitAt:new Date().toISOString(),
+      lastExitCode:code ?? null,
+      lastExitSignal:signal ?? null,
+      retryCount:Number(retryCount || 0)
+    }).catch(() => {});
 
     void notifyTelegram(`⚠️ Stream Harbor
 Slot ${id}: FFmpeg/worker завершился аварийно
@@ -1483,20 +1551,42 @@ Slot ${id}: FFmpeg/worker завершился аварийно
             rtmpUrl:baseUrl
           });
         } catch (err) {
+          const restartError = sanitizeLog(err?.message || err);
+          await updateSlotState(id, {
+            desired:"stopped",
+            lastError:`auto_restart_failed: ${restartError}`,
+            stoppedAt:new Date().toISOString(),
+            retryCount:retryCount + 1
+          }).catch(() => {});
           console.error(JSON.stringify({
             event:"worker_auto_restart_failed",
             slotId:id,
             attempt:retryCount + 1,
-            error:sanitizeLog(err?.message || err)
+            error:restartError
           }));
           void notifyTelegram(`🚨 Stream Harbor
 Slot ${id}: автоперезапуск не удался
 Попытка: ${retryCount + 1}
-Ошибка: ${sanitizeLog(err?.message || err)}`);
+Ошибка: ${restartError}
+Слот переведён в STOPPED для безопасного ручного запуска после проверки.`);
         }
       }, 10_000);
 
       restartTimers.set(id, timer);
+    } else if (
+      desired.desired === "running" &&
+      desired.mediaId === source.id &&
+      retryCount >= 3
+    ) {
+      await updateSlotState(id, {
+        desired:"stopped",
+        lastError:"auto_restart_limit_exhausted",
+        stoppedAt:new Date().toISOString(),
+        retryCount
+      }).catch(() => {});
+      void notifyTelegram(`🚨 Stream Harbor
+Slot ${id}: лимит автоперезапусков исчерпан
+Слот остановлен. Требуется ручная проверка перед следующим запуском.`);
     }
   });
 
@@ -1505,12 +1595,37 @@ Slot ${id}: автоперезапуск не удался
       desired:"running",
       mediaId:source.id,
       streamId:streamId || null,
-      requestedAt:new Date().toISOString()
+      requestedAt:new Date().toISOString(),
+      lastError:null,
+      lastExitAt:null,
+      lastExitCode:null,
+      lastExitSignal:null,
+      retryCount:0
+    });
+    void logEvent("stream_start", {
+      slotId:id,
+      mediaId:source.id,
+      streamId:streamId || null,
+      sourceKind:source.sourceKind || "unknown"
     });
     void notifyTelegram(`▶️ Stream Harbor
 Slot ${id}: запуск потока
 Файл: ${sourceName}`);
   } else {
+    await updateSlotState(id, {
+      desired:"running",
+      mediaId:source.id,
+      streamId:streamId || null,
+      recoveredAt:new Date().toISOString(),
+      lastError:null,
+      retryCount:Number(retryCount || 0)
+    }).catch(() => {});
+    void logEvent("stream_restore", {
+      slotId:id,
+      mediaId:source.id,
+      streamId:streamId || null,
+      retryCount:Number(retryCount || 0)
+    });
     void notifyTelegram(`♻️ Stream Harbor
 Slot ${id}: поток восстановлен после перезапуска
 Файл: ${sourceName}`);
@@ -1539,7 +1654,9 @@ async function stopSlot(slotId) {
   await updateSlotState(id, {
     desired:"stopped",
     streamId:null,
-    stoppedAt:new Date().toISOString()
+    stoppedAt:new Date().toISOString(),
+    lastError:null,
+    retryCount:0
   });
 
   const active = activeSlots.get(id);
@@ -1555,6 +1672,12 @@ async function stopSlot(slotId) {
     try { active.worker.kill("SIGKILL"); } catch {}
   }, 8000).unref();
 
+  void logEvent("stream_stop", {
+    slotId:id,
+    mediaId:active.file,
+    streamId:active.streamId || null,
+    pid:active.pid
+  });
   void notifyTelegram(`⏹ Stream Harbor
 Slot ${id}: поток остановлен
 Файл: ${stopName}`);
@@ -1595,12 +1718,13 @@ setInterval(() => {
       active.healthRestarting = true;
       const reason = heartbeatStale ? "worker heartbeat stale" : "FFmpeg metrics stale";
 
-      console.error(JSON.stringify({
-        event:"stream_health_restart",
+      const healthEvent = {
         slotId,
         reason,
         mediaId:active.file
-      }));
+      };
+      console.error(JSON.stringify({ event:"stream_health_restart", ...healthEvent }));
+      void logEvent("stream_health_restart", healthEvent);
 
       void notifyTelegram(`🚨 Stream Harbor
 Slot ${slotId}: поток завис
@@ -2456,6 +2580,11 @@ app.get("/api/system", requireOwner, async (_req, res) => {
     telegramConfigured:telegramConfigured(),
     storage:await storageStats()
   });
+});
+
+app.get("/api/events", requireOwner, async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  res.json({ items:await readEvents(req.query?.limit) });
 });
 
 app.get("/api/media", requireOwner, async (_req, res) => {
@@ -3881,6 +4010,10 @@ await readStreamConfigs();
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Stream Harbor backend listening on ${PORT}`);
+  void logEvent("server_start", {
+    slotCount:STREAM_SLOT_COUNT,
+    executionMode:STREAM_EXECUTION_MODE
+  });
   console.log(JSON.stringify({
     event:"server_config",
     slotCount:STREAM_SLOT_COUNT,

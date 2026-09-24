@@ -20,6 +20,7 @@
       <nav>
         <button class="nav-item active" data-view="streams"><span>▦</span> My streams</button>
         <button class="nav-item" data-view="storage"><span>▰</span> Storage</button>
+        <button class="nav-item" data-view="events"><span>≡</span> Events</button>
       </nav>
       <div class="sidebar-footer">
         <a href="/test-control">Emergency control</a>
@@ -43,7 +44,7 @@
           <button id="addStreamBtn" class="btn primary">＋ Add Stream</button>
           <button id="refreshBtn" class="btn secondary">↻ Refresh</button>
           <button id="stopAllBtn" class="btn danger">■ Stop All</button>
-          <div class="hint"><span id="streamCount">0</span>/<span id="slotCount">8</span> streams</div>
+          <div class="hint"><span id="streamCount">0</span>/<span id="slotCount">8</span> live</div>
         </div>
         <div id="streamsGrid" class="streams-grid"></div>
       </section>
@@ -60,6 +61,14 @@
           <div id="uploadState" class="hint">All uploaded videos live here and can be assigned to any stream.</div>
         </div>
         <div id="storageGrid" class="storage-grid"></div>
+      </section>
+
+      <section id="eventsView" class="view hidden">
+        <div class="toolbar">
+          <button id="refreshEventsBtn" class="btn secondary">↻ Refresh</button>
+          <div class="hint">Последние события Stream Harbor без stream keys и секретов.</div>
+        </div>
+        <div id="eventsList" class="events-list"></div>
       </section>
     </main>
   </div>

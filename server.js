@@ -73,6 +73,9 @@ const BUCKET_MEDIA_FILE = path.join(MEDIA_DIR, ".bucket-media.json");
 const LEGACY_STATE_FILE = path.join(MEDIA_DIR, ".stream-state.json");
 const SLOT_STATE_FILE = path.join(MEDIA_DIR, ".slots-state.json");
 const STREAM_CONFIGS_FILE = path.join(MEDIA_DIR, ".stream-configs.json");
+const EVENT_LOG_FILE = path.join(MEDIA_DIR, ".stream-events.jsonl");
+const EVENT_LOG_ARCHIVE_FILE = path.join(MEDIA_DIR, ".stream-events.1.jsonl");
+const MAX_EVENT_LOG_BYTES = 5 * 1024 * 1024;
 
 await fs.mkdir(MEDIA_DIR, { recursive: true });
 
@@ -165,6 +168,49 @@ function sanitizeLog(value) {
   // Never persist temporary signed URLs or query credentials in logs/state/Telegram.
   s = s.replace(/(https?:\/\/[^\s?]+)\?[^\s]*/gi, "$1?[REDACTED_QUERY]");
   return s;
+}
+
+async function logEvent(type, data={}) {
+  try {
+    const record = sanitizeLog(JSON.stringify({
+      ts:new Date().toISOString(),
+      type:String(type || "event").slice(0,80),
+      ...data
+    })) + "\n";
+
+    try {
+      const st = await fs.stat(EVENT_LOG_FILE);
+      if (Number(st.size || 0) >= MAX_EVENT_LOG_BYTES) {
+        await fs.unlink(EVENT_LOG_ARCHIVE_FILE).catch(() => {});
+        await fs.rename(EVENT_LOG_FILE, EVENT_LOG_ARCHIVE_FILE).catch(() => {});
+      }
+    } catch {}
+
+    await fs.appendFile(EVENT_LOG_FILE, record, "utf8");
+  } catch (err) {
+    console.error(JSON.stringify({
+      event:"event_log_write_failed",
+      error:sanitizeLog(err?.message || err)
+    }));
+  }
+}
+
+async function readEvents(limit=100) {
+  const n = Math.max(1, Math.min(500, Number(limit || 100)));
+  try {
+    const raw = await fs.readFile(EVENT_LOG_FILE, "utf8");
+    return raw
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .slice(-n)
+      .reverse()
+      .map(line => {
+        try { return JSON.parse(sanitizeLog(line)); }
+        catch { return { ts:null, type:"invalid_event", detail:sanitizeLog(line).slice(0,500) }; }
+      });
+  } catch {
+    return [];
+  }
 }
 
 function telegramConfigured() {
@@ -1456,14 +1502,15 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
     const snapshot = activeSlots.get(id);
     if (snapshot?.pid === worker.pid) activeSlots.delete(id);
 
-    console.log(JSON.stringify({
-      event:"worker_exit",
+    const exitEvent = {
       slotId:id,
-      code,
-      signal,
+      code:code ?? null,
+      signal:signal ?? null,
       mediaId:source.id,
       intentional:Boolean(snapshot?.intentionalStop)
-    }));
+    };
+    console.log(JSON.stringify({ event:"worker_exit", ...exitEvent }));
+    void logEvent("worker_exit", exitEvent);
 
     if (snapshot?.intentionalStop) return;
 
@@ -1555,6 +1602,12 @@ Slot ${id}: лимит автоперезапусков исчерпан
       lastExitSignal:null,
       retryCount:0
     });
+    void logEvent("stream_start", {
+      slotId:id,
+      mediaId:source.id,
+      streamId:streamId || null,
+      sourceKind:source.sourceKind || "unknown"
+    });
     void notifyTelegram(`▶️ Stream Harbor
 Slot ${id}: запуск потока
 Файл: ${sourceName}`);
@@ -1567,6 +1620,12 @@ Slot ${id}: запуск потока
       lastError:null,
       retryCount:Number(retryCount || 0)
     }).catch(() => {});
+    void logEvent("stream_restore", {
+      slotId:id,
+      mediaId:source.id,
+      streamId:streamId || null,
+      retryCount:Number(retryCount || 0)
+    });
     void notifyTelegram(`♻️ Stream Harbor
 Slot ${id}: поток восстановлен после перезапуска
 Файл: ${sourceName}`);
@@ -1613,6 +1672,12 @@ async function stopSlot(slotId) {
     try { active.worker.kill("SIGKILL"); } catch {}
   }, 8000).unref();
 
+  void logEvent("stream_stop", {
+    slotId:id,
+    mediaId:active.file,
+    streamId:active.streamId || null,
+    pid:active.pid
+  });
   void notifyTelegram(`⏹ Stream Harbor
 Slot ${id}: поток остановлен
 Файл: ${stopName}`);
@@ -1653,12 +1718,13 @@ setInterval(() => {
       active.healthRestarting = true;
       const reason = heartbeatStale ? "worker heartbeat stale" : "FFmpeg metrics stale";
 
-      console.error(JSON.stringify({
-        event:"stream_health_restart",
+      const healthEvent = {
         slotId,
         reason,
         mediaId:active.file
-      }));
+      };
+      console.error(JSON.stringify({ event:"stream_health_restart", ...healthEvent }));
+      void logEvent("stream_health_restart", healthEvent);
 
       void notifyTelegram(`🚨 Stream Harbor
 Slot ${slotId}: поток завис
@@ -2514,6 +2580,11 @@ app.get("/api/system", requireOwner, async (_req, res) => {
     telegramConfigured:telegramConfigured(),
     storage:await storageStats()
   });
+});
+
+app.get("/api/events", requireOwner, async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  res.json({ items:await readEvents(req.query?.limit) });
 });
 
 app.get("/api/media", requireOwner, async (_req, res) => {
@@ -3939,6 +4010,10 @@ await readStreamConfigs();
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Stream Harbor backend listening on ${PORT}`);
+  void logEvent("server_start", {
+    slotCount:STREAM_SLOT_COUNT,
+    executionMode:STREAM_EXECUTION_MODE
+  });
   console.log(JSON.stringify({
     event:"server_config",
     slotCount:STREAM_SLOT_COUNT,

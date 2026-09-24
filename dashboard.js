@@ -40,7 +40,7 @@ async function api(url,opts={}){
 }
 
 function isLive(s){
-  return ["live_or_starting","restarting","recovering","stopping"].includes(s?.runtime?.state);
+  return ["starting","live_or_starting","restarting","recovering","stopping"].includes(s?.runtime?.state);
 }
 function getMedia(id){return state.media.find(m=>m.id===id)||null}
 function getCache(id){return state.cacheStatus[id]||{state:"not_cached",progressPct:0}}
@@ -71,6 +71,7 @@ function badgeInfo(s){
   const runtime=s?.runtime||{};
   const st=runtime.state||"idle";
   const health=runtime.health?.state||"";
+  if(st==="starting") return {text:"STARTING",klass:"warning"};
   if(st==="restarting") return {text:"RESTARTING",klass:"warning"};
   if(st==="recovering") return {text:"RECOVERING",klass:"warning"};
   if(st==="live_or_starting"){
@@ -646,7 +647,7 @@ async function refreshRuntime(){
     ]);
     const fresh=s.items||[];
     q("#serverStatus").textContent=h.ok
-      ?"Server online · "+Number(h.streamingSlots||0)+" active"
+      ?"Server online · "+Number(h.streamingSlots||0)+" live"+(Number(h.startingSlots||0)?" · "+Number(h.startingSlots)+" starting":"")
       :"Server problem";
     q("#streamCount").textContent=fresh.filter(isLive).length;
 
@@ -768,7 +769,7 @@ async function loadAll(){
     state.media=m.items||[];
     state.slotCount=Math.max(1,Number(h.slotCount||8));
     q("#serverStatus").textContent=h.ok
-      ?"Server online · "+Number(h.streamingSlots||0)+" active"
+      ?"Server online · "+Number(h.streamingSlots||0)+" live"+(Number(h.startingSlots||0)?" · "+Number(h.startingSlots)+" starting":"")
       :"Server problem";
     await refreshCacheStatuses();
     renderStreams();

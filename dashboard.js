@@ -107,6 +107,7 @@ function storageCard(m){
   const bucket=m.sourceType==="bucket";
   const uploading=m.status==="UPLOADING";
   const stalled=m.status==="STALLED";
+  const paused=m.status==="UPLOAD_PAUSED";
   const analyzing=m.status==="ANALYZING";
   const progressPct=Math.max(0,Math.min(100,Math.round(Number(m.progressPct||0))));
   const source=m.sourceVideoBitrate;
@@ -120,6 +121,7 @@ function storageCard(m){
   else if(queued) action='<button class="btn secondary" disabled>Queued</button>';
   else if(uploading) action='<button class="btn secondary" disabled>Uploading '+progressPct+'%</button>';
   else if(stalled) action='<button class="btn danger" disabled>UPLOAD STALLED</button>';
+  else if(paused) action='<button class="btn secondary" disabled>Resume: choose same file</button>';
   else if(analyzing) action='<button class="btn secondary" disabled>Checking…</button>';
   else if(bucket) action='<button class="btn primary prepareBtn">Prepare for stream</button>';
   else action='<button class="btn primary prepareBtn">'+(optimize?'Optimize bitrate':'Prepare')+'</button>';
@@ -130,8 +132,8 @@ function storageCard(m){
       <div>Status: ${esc(m.status||"UNKNOWN")}</div>
       ${m.error?'<div class="storage-error">Error: '+esc(m.error)+'</div>':""}
       ${m.prepareError?'<div class="storage-error">Prepare: '+esc(m.prepareError)+'</div>':""}
-      ${(uploading||stalled)?'<div class="upload-progress-label">'+progressPct+'% · '+esc(m.uploadedParts||0)+'/'+esc(m.totalParts||0)+' parts</div><div class="upload-progress"><span style="width:'+progressPct+'%"></span></div>':""}
-      ${m.lastProgressAt&&(uploading||stalled)?'<div>Last progress: '+esc(new Date(m.lastProgressAt).toLocaleTimeString())+'</div>':""}
+      ${(uploading||stalled||paused)?'<div class="upload-progress-label">'+progressPct+'% · '+esc(m.uploadedParts||0)+'/'+esc(m.totalParts||0)+' parts</div><div class="upload-progress"><span style="width:'+progressPct+'%"></span></div>':""}
+      ${m.lastProgressAt&&(uploading||stalled||paused)?'<div>Last progress: '+esc(new Date(m.lastProgressAt).toLocaleTimeString())+'</div>':""}
       <div>${esc(v.codec?String(v.codec).toUpperCase():"")} ${v.width&&v.height?esc(v.width+"×"+v.height):""}</div>
       <div>Size: ${fmtMb(m.preparedSize||m.size)}</div>
       ${source?'<div>Source video bitrate: '+esc(source)+' Kbps</div>':""}
@@ -399,29 +401,41 @@ q("#fileInput").addEventListener("change",async e=>{
   const f=e.target.files?.[0]; if(!f)return;
   q("#uploadState").textContent="Preparing multipart upload: "+f.name+"…";
 
-  let uploadId=null;
+  let mediaId=null;
   try{
     const prep=await api("/api/bucket/multipart/start",{
       method:"POST",
       body:JSON.stringify({name:f.name,size:f.size,type:f.type||"video/mp4"})
     });
-    uploadId=prep.id;
+    mediaId=prep.id;
     await refreshStorageOnly().catch(()=>{});
 
-    const parts=[];
-    const total=prep.totalParts;
-    const partSize=prep.partSize;
+    const total=Number(prep.totalParts);
+    const partSize=Number(prep.partSize);
+    const completed=new Map(
+      (prep.completedParts||[]).map(p=>[Number(p.PartNumber),{PartNumber:Number(p.PartNumber),ETag:p.ETag}])
+    );
 
+    const pending=[];
     for(let i=1;i<=total;i++){
+      if(!completed.has(i)) pending.push(i);
+    }
+
+    const initialPct=Math.floor(Number(prep.progressPct||0));
+    q("#uploadState").textContent=(prep.resumed?"Resuming ":"Uploading ")+f.name+
+      " · "+initialPct+"% · "+completed.size+"/"+total+" parts · 3 parallel";
+
+    let completedBytes=Number(prep.uploadedBytes||0);
+    let fatalErr=null;
+    let nextIndex=0;
+
+    async function uploadPart(i){
       const from=(i-1)*partSize;
       const to=Math.min(f.size,from+partSize);
       const blob=f.slice(from,to);
-      const pct=Math.floor((from/f.size)*100);
-      q("#uploadState").textContent="Uploading "+f.name+" · "+pct+"% · part "+i+"/"+total;
 
-      let uploaded=false;
       let lastErr=null;
-      for(let attempt=1;attempt<=3 && !uploaded;attempt++){
+      for(let attempt=1;attempt<=3;attempt++){
         try{
           const signed=await api("/api/bucket/multipart/"+encodeURIComponent(prep.id)+"/part-url",{
             method:"POST",
@@ -431,21 +445,50 @@ q("#fileInput").addEventListener("change",async e=>{
           if(!up.ok) throw new Error("part "+i+" HTTP "+up.status);
           const etag=up.headers.get("etag");
           if(!etag) throw new Error("part "+i+" ETag missing");
-          parts.push({PartNumber:i,ETag:etag});
-          const donePct=Math.floor((to/f.size)*100);
-          q("#uploadState").textContent="Uploading "+f.name+" · "+donePct+"% · part "+i+"/"+total;
-          await api("/api/bucket/multipart/"+encodeURIComponent(prep.id)+"/progress",{
+
+          completed.set(i,{PartNumber:i,ETag:etag});
+          completedBytes+=blob.size;
+
+          const progress=await api("/api/bucket/multipart/"+encodeURIComponent(prep.id)+"/progress",{
             method:"POST",
-            body:JSON.stringify({partNumber:i,uploadedBytes:to,progressPct:donePct})
-          }).catch(()=>{});
-          uploaded=true;
+            body:JSON.stringify({partNumber:i})
+          }).catch(()=>null);
+
+          const pct=progress?.progressPct!=null
+            ? Math.floor(progress.progressPct)
+            : Math.floor((completedBytes/f.size)*100);
+
+          q("#uploadState").textContent="Uploading "+f.name+
+            " · "+pct+"% · "+completed.size+"/"+total+" parts · 3 parallel";
+          return;
         }catch(err){
           lastErr=err;
           if(attempt<3) await new Promise(r=>setTimeout(r,1500*attempt));
         }
       }
-      if(!uploaded) throw lastErr||new Error("part "+i+" failed");
+      throw lastErr||new Error("part "+i+" failed");
     }
+
+    async function worker(){
+      while(true){
+        if(fatalErr) return;
+        const idx=nextIndex++;
+        if(idx>=pending.length) return;
+        const partNo=pending[idx];
+        try{
+          await uploadPart(partNo);
+        }catch(err){
+          fatalErr=err;
+          return;
+        }
+      }
+    }
+
+    await Promise.all([worker(),worker(),worker()]);
+    if(fatalErr) throw fatalErr;
+
+    const parts=[...completed.values()].sort((a,b)=>a.PartNumber-b.PartNumber);
+    if(parts.length!==total) throw new Error("multipart_parts_incomplete_after_upload");
 
     q("#uploadState").textContent="Finalizing "+f.name+"…";
     await api("/api/bucket/multipart/"+encodeURIComponent(prep.id)+"/complete",{
@@ -462,16 +505,16 @@ q("#fileInput").addEventListener("change",async e=>{
       if(["READY_DIRECT","PREPARE_NEEDED","ERROR"].includes(media.status)){
         await loadAll();
         if(media.status==="READY_DIRECT") toast("Video is READY for streaming");
-        else if(media.status==="PREPARE_NEEDED") toast("Video uploaded, but needs a stream-compatible re-export",true);
+        else if(media.status==="PREPARE_NEEDED") toast("Video uploaded, but needs stream preparation",true);
         else toast("Video analysis failed",true);
         break;
       }
     }
   }catch(err){
-    q("#uploadState").textContent="Upload failed: "+(err?.message||err);
-    toast(err?.message||String(err),true);
-    if(uploadId){
-      api("/api/bucket/multipart/"+encodeURIComponent(uploadId)+"/abort",{
+    q("#uploadState").textContent="Upload paused: "+(err?.message||err);
+    toast("Upload paused. Choose the same file to resume.",true);
+    if(mediaId){
+      api("/api/bucket/multipart/"+encodeURIComponent(mediaId)+"/pause",{
         method:"POST",body:"{}"
       }).catch(()=>{});
     }

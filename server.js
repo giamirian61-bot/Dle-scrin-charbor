@@ -898,6 +898,14 @@ let prepareJob = null;
 const prepareQueue = [];
 const queuedPrepareIds = new Set();
 
+const STREAM_HEALTH_CHECK_MS = 10_000;
+const STREAM_HEARTBEAT_STALE_MS = 30_000;
+const STREAM_METRICS_STALE_MS = 30_000;
+const STREAM_LOW_SPEED_WARN = 0.90;
+const STREAM_LOW_SPEED_RESTART = 0.75;
+const STREAM_LOW_SPEED_RESTART_MS = 60_000;
+const STREAM_STARTUP_GRACE_MS = 45_000;
+
 function buildFfmpegArgs(filePath, profile, target) {
   const common = [
     "-re",
@@ -1187,7 +1195,7 @@ function slotStatusPayload(slotId, desiredState=null) {
 
   return {
     slotId:id,
-    state:"live_or_starting",
+    state:active.intentionalStop ? "stopping" : "live_or_starting",
     desired:desired?.desired || "running",
     keyConfigured:Boolean(streamKeyForSlot(id)),
     pid:active.pid,
@@ -1199,6 +1207,13 @@ function slotStatusPayload(slotId, desiredState=null) {
     cacheHit:Boolean(active.cacheHit),
     profile:active.profile,
     metrics:active.metrics,
+    health:{
+      state:active.healthState || "starting",
+      lastHeartbeatAt:active.lastHeartbeatAt || null,
+      lastMetricAt:active.lastMetricAt || null,
+      lowSpeedSince:active.lowSpeedSince || null,
+      retryCount:Number(active.retryCount || 0)
+    },
     lastError:active.lastError
   };
 }
@@ -1248,6 +1263,12 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
     lastError:null,
     intentionalStop:false,
     retryCount,
+    healthState:"starting",
+    lastHeartbeatAt:new Date().toISOString(),
+    lastMetricAt:null,
+    lowSpeedSince:null,
+    lowSpeedWarned:false,
+    healthRestarting:false,
     streamId:streamId || null
   };
   activeSlots.set(id, active);
@@ -1256,10 +1277,17 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
     const current = activeSlots.get(id);
     if (!current || current.pid !== worker.pid || !msg) return;
 
-    if (msg.type === "metrics" && msg.metrics) {
+    if (msg.type === "heartbeat") {
+      current.lastHeartbeatAt = new Date().toISOString();
+      if (current.healthState === "starting") current.healthState = "healthy";
+    } else if (msg.type === "metrics" && msg.metrics) {
       current.metrics = { ...current.metrics, ...msg.metrics };
+      current.lastMetricAt = new Date().toISOString();
+      current.lastHeartbeatAt = current.lastHeartbeatAt || current.lastMetricAt;
+      if (!current.healthRestarting) current.healthState = "healthy";
     } else if (msg.type === "ffmpeg_error" || msg.type === "fatal") {
       current.lastError = sanitizeLog(msg.error || "worker_error");
+      current.healthState = "warning";
     }
   });
 
@@ -1371,7 +1399,7 @@ async function stopSlot(slotId) {
   const stopMeta = (await getBucketMedia(active.file)) || await readMeta(active.file).catch(() => null);
   const stopName = stopMeta?.originalName || active.file;
   active.intentionalStop = true;
-  activeSlots.delete(id);
+  active.healthState = "stopping";
 
   try { active.worker.kill("SIGTERM"); } catch {}
   setTimeout(() => {
@@ -1385,6 +1413,89 @@ Slot ${id}: поток остановлен
   return { ok:true, slotId:id, state:"stopping", pid:active.pid };
 }
 
+
+function parseFfmpegSpeed(value) {
+  const n = Number(String(value || "").replace(/x$/i, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [slotId, active] of activeSlots) {
+    if (active.intentionalStop || active.healthRestarting) continue;
+
+    const startedMs = Date.parse(active.startedAt || 0);
+    if (!startedMs || now - startedMs < STREAM_STARTUP_GRACE_MS) continue;
+
+    const heartbeatMs = Date.parse(active.lastHeartbeatAt || 0);
+    const metricMs = Date.parse(active.lastMetricAt || 0);
+    const heartbeatStale = !heartbeatMs || now - heartbeatMs > STREAM_HEARTBEAT_STALE_MS;
+    const metricsStale = !metricMs || now - metricMs > STREAM_METRICS_STALE_MS;
+
+    if (heartbeatStale || metricsStale) {
+      active.healthState = "stalled";
+      active.healthRestarting = true;
+      const reason = heartbeatStale ? "worker heartbeat stale" : "FFmpeg metrics stale";
+
+      console.error(JSON.stringify({
+        event:"stream_health_restart",
+        slotId,
+        reason,
+        mediaId:active.file
+      }));
+
+      void notifyTelegram(`🚨 Stream Harbor
+Slot ${slotId}: поток завис
+Причина: ${reason}
+Автоперезапуск запускается`);
+
+      try { active.worker.kill("SIGTERM"); } catch {}
+      setTimeout(() => {
+        try { active.worker.kill("SIGKILL"); } catch {}
+      }, 5000).unref();
+      continue;
+    }
+
+    const speed = parseFfmpegSpeed(active.metrics?.speed);
+    if (speed == null) continue;
+
+    if (speed < STREAM_LOW_SPEED_WARN) {
+      if (!active.lowSpeedSince) active.lowSpeedSince = new Date().toISOString();
+      active.healthState = "warning";
+
+      const lowSinceMs = Date.parse(active.lowSpeedSince);
+      const lowForMs = now - lowSinceMs;
+
+      if (!active.lowSpeedWarned && lowForMs >= 30_000) {
+        active.lowSpeedWarned = true;
+        void notifyTelegram(`⚠️ Stream Harbor
+Slot ${slotId}: скорость потока снижена
+FFmpeg speed: ${speed.toFixed(2)}x
+Наблюдаю, без немедленного рестарта`);
+      }
+
+      if (speed < STREAM_LOW_SPEED_RESTART && lowForMs >= STREAM_LOW_SPEED_RESTART_MS) {
+        active.healthRestarting = true;
+        active.healthState = "stalled";
+
+        void notifyTelegram(`🚨 Stream Harbor
+Slot ${slotId}: поток слишком медленный
+FFmpeg speed: ${speed.toFixed(2)}x более 60 секунд
+Автоперезапуск запускается`);
+
+        try { active.worker.kill("SIGTERM"); } catch {}
+        setTimeout(() => {
+          try { active.worker.kill("SIGKILL"); } catch {}
+        }, 5000).unref();
+      }
+    } else {
+      active.lowSpeedSince = null;
+      active.lowSpeedWarned = false;
+      active.healthState = "healthy";
+    }
+  }
+}, STREAM_HEALTH_CHECK_MS).unref();
 
 function ffmpegTimeToSeconds(value) {
   const m = String(value || "").match(/^(\d+):(\d+):(\d+(?:\.\d+)?)$/);

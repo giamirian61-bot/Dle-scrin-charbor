@@ -5,6 +5,9 @@ import multer from "multer";
 import { spawn, execFile, fork } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import {
@@ -28,6 +31,11 @@ app.set("trust proxy", 1);
 
 const PORT = 3000;
 const MEDIA_DIR = process.env.MEDIA_DIR || "/data/media";
+const STREAM_CACHE_DIR = process.env.STREAM_CACHE_DIR || "/tmp/stream-harbor-cache";
+const STREAM_CACHE_RESERVE_BYTES = Math.max(
+  128 * 1024 * 1024,
+  Number(process.env.STREAM_CACHE_RESERVE_BYTES || 256 * 1024 * 1024)
+);
 const OWNER_TOKEN = process.env.OWNER_TOKEN || "";
 const YOUTUBE_STREAM_KEY = process.env.YOUTUBE_STREAM_KEY || "";
 const YOUTUBE_RTMPS_BASE = process.env.YOUTUBE_RTMPS_BASE || "rtmps://a.rtmps.youtube.com/live2";
@@ -934,6 +942,137 @@ function buildFfmpegArgs(filePath, profile, target) {
   ];
 }
 
+const streamCacheJobs = new Map();
+
+function streamCacheKeyPath(mediaId, objectKey) {
+  const ext = path.extname(objectKey || mediaId).slice(0, 10).replace(/[^.a-zA-Z0-9]/g, "") || ".mp4";
+  const base = path.basename(mediaId, path.extname(mediaId)).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100) || "media";
+  const hash = crypto.createHash("sha256").update(String(objectKey || mediaId)).digest("hex").slice(0, 16);
+  return path.join(STREAM_CACHE_DIR, `${base}-${hash}${ext}`);
+}
+
+async function streamCacheDiskInfo() {
+  await fs.mkdir(STREAM_CACHE_DIR, { recursive:true });
+  const stat = await fs.statfs(STREAM_CACHE_DIR);
+  const blockSize = Number(stat.bsize || stat.frsize || 4096);
+  return {
+    totalBytes:Number(stat.blocks || 0) * blockSize,
+    availableBytes:Number(stat.bavail || stat.bfree || 0) * blockSize
+  };
+}
+
+async function removeCachedMedia(mediaId) {
+  await fs.mkdir(STREAM_CACHE_DIR, { recursive:true });
+  const prefix = path.basename(String(mediaId || ""), path.extname(String(mediaId || "")))
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(0, 100);
+  if (!prefix) return;
+  const entries = await fs.readdir(STREAM_CACHE_DIR, { withFileTypes:true }).catch(() => []);
+  await Promise.all(entries
+    .filter(entry => entry.isFile() && entry.name.startsWith(prefix + "-"))
+    .map(entry => fs.unlink(path.join(STREAM_CACHE_DIR, entry.name)).catch(() => {})));
+}
+
+async function pruneStreamCache(requiredBytes, targetPath) {
+  let disk = await streamCacheDiskInfo();
+  if (disk.availableBytes >= requiredBytes + STREAM_CACHE_RESERVE_BYTES) return disk;
+
+  const activePaths = new Set(
+    [...activeSlots.values()]
+      .map(slot => slot.streamPath)
+      .filter(Boolean)
+  );
+
+  const entries = await fs.readdir(STREAM_CACHE_DIR, { withFileTypes:true }).catch(() => []);
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const full = path.join(STREAM_CACHE_DIR, entry.name);
+    if (full === targetPath || activePaths.has(full)) continue;
+    try {
+      const st = await fs.stat(full);
+      candidates.push({ full, mtimeMs:st.mtimeMs || 0 });
+    } catch {}
+  }
+  candidates.sort((a,b) => a.mtimeMs - b.mtimeMs);
+
+  for (const item of candidates) {
+    await fs.unlink(item.full).catch(() => {});
+    disk = await streamCacheDiskInfo();
+    if (disk.availableBytes >= requiredBytes + STREAM_CACHE_RESERVE_BYTES) break;
+  }
+  return disk;
+}
+
+async function ensureBucketStreamCache(mediaId, objectKey, expectedSize, originalName) {
+  const cachePath = streamCacheKeyPath(mediaId, objectKey);
+
+  try {
+    const st = await fs.stat(cachePath);
+    if (!expectedSize || Number(st.size) === Number(expectedSize)) {
+      await fs.utimes(cachePath, new Date(), new Date()).catch(() => {});
+      return { path:cachePath, sourceKind:"local_cache", cacheHit:true, size:st.size };
+    }
+    await fs.unlink(cachePath).catch(() => {});
+  } catch {}
+
+  if (streamCacheJobs.has(cachePath)) return await streamCacheJobs.get(cachePath);
+
+  const job = (async () => {
+    const required = Math.max(1, Number(expectedSize || 0));
+    const disk = await pruneStreamCache(required, cachePath);
+    if (required && disk.availableBytes < required + STREAM_CACHE_RESERVE_BYTES) {
+      throw new Error(`stream_cache_insufficient_space required=${required} available=${disk.availableBytes}`);
+    }
+
+    const tempPath = cachePath + ".part-" + crypto.randomUUID();
+    const readUrl = await createBucketReadUrl(objectKey, 21600);
+
+    void notifyTelegram(`⬇️ Stream Harbor
+Кэширование перед эфиром
+Файл: ${originalName || mediaId}
+Размер: ${expectedSize ? (Number(expectedSize)/1024/1024).toFixed(1) + " MB" : "unknown"}`);
+
+    try {
+      const response = await fetch(readUrl, {
+        signal:AbortSignal.timeout(60 * 60 * 1000)
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`stream_cache_download_http_${response.status}`);
+      }
+
+      await pipeline(
+        Readable.fromWeb(response.body),
+        createWriteStream(tempPath, { flags:"wx" })
+      );
+
+      const st = await fs.stat(tempPath);
+      if (expectedSize && Number(st.size) !== Number(expectedSize)) {
+        throw new Error(`stream_cache_size_mismatch expected=${expectedSize} actual=${st.size}`);
+      }
+
+      await fs.rename(tempPath, cachePath);
+
+      void notifyTelegram(`✅ Stream Harbor
+Файл закэширован для стабильного эфира
+Файл: ${originalName || mediaId}
+Локальный размер: ${(st.size/1024/1024).toFixed(1)} MB`);
+
+      return { path:cachePath, sourceKind:"local_cache", cacheHit:false, size:st.size };
+    } catch (err) {
+      await fs.unlink(tempPath).catch(() => {});
+      throw err;
+    }
+  })();
+
+  streamCacheJobs.set(cachePath, job);
+  try {
+    return await job;
+  } finally {
+    streamCacheJobs.delete(cachePath);
+  }
+}
+
 async function resolveStreamSource(mediaId) {
   const id = path.basename(String(mediaId || ""));
   if (!id || id.startsWith(".")) throw new Error("invalid_media_id");
@@ -943,15 +1082,25 @@ async function resolveStreamSource(mediaId) {
     const effectiveKey = bucketItem.preparedKey || bucketItem.key;
     const effectiveProbe = bucketItem.preparedProbe || bucketItem.probe;
     const effectiveProfile = bucketItem.preparedProfile || bucketItem.profile;
+    const effectiveSize = Number(bucketItem.preparedSize || bucketItem.size || 0);
     if (bucketItem.status !== "READY_DIRECT" || !effectiveProfile?.streamReady || effectiveProfile.mode !== "copy") {
       throw new Error("media_requires_preparation");
     }
-    const streamPath = await createBucketReadUrl(effectiveKey, 604800);
+
+    const cached = await ensureBucketStreamCache(
+      id,
+      effectiveKey,
+      effectiveSize,
+      bucketItem.originalName || id
+    );
+
     return {
       id,
-      streamPath,
+      streamPath:cached.path,
       streamProbe:effectiveProbe,
-      profile:effectiveProfile
+      profile:effectiveProfile,
+      sourceKind:cached.sourceKind,
+      cacheHit:cached.cacheHit
     };
   }
 
@@ -996,7 +1145,7 @@ async function resolveStreamSource(mediaId) {
     throw new Error("media_requires_preparation");
   }
 
-  return { id, streamPath, streamProbe, profile };
+  return { id, streamPath, streamProbe, profile, sourceKind:"local_volume", cacheHit:true };
 }
 
 function slotStatusPayload(slotId, desiredState=null) {
@@ -1025,6 +1174,8 @@ function slotStatusPayload(slotId, desiredState=null) {
     streamId:active.streamId || desired?.streamId || null,
     startedAt:active.startedAt,
     mode:active.mode,
+    sourceKind:active.sourceKind || null,
+    cacheHit:Boolean(active.cacheHit),
     profile:active.profile,
     metrics:active.metrics,
     lastError:active.lastError
@@ -1061,6 +1212,9 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
     startedAt:new Date().toISOString(),
     worker,
     mode:"copy",
+    sourceKind:source.sourceKind || "unknown",
+    streamPath:source.streamPath,
+    cacheHit:Boolean(source.cacheHit),
     profile:source.profile,
     probe:source.streamProbe,
     metrics:{
@@ -1169,6 +1323,8 @@ Slot ${id}: поток восстановлен после перезапуск�
     pid:worker.pid,
     mediaId:source.id,
     mode:"copy",
+    sourceKind:source.sourceKind || "unknown",
+    cacheHit:Boolean(source.cacheHit),
     profile:source.profile,
     probe:source.streamProbe
   };

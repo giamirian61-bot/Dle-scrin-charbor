@@ -79,6 +79,16 @@ const MAX_EVENT_LOG_BYTES = 5 * 1024 * 1024;
 
 await fs.mkdir(MEDIA_DIR, { recursive: true });
 
+async function atomicWriteJson(filePath, value) {
+  const tmp = filePath + ".tmp-" + process.pid + "-" + crypto.randomUUID();
+  try {
+    await fs.writeFile(tmp, JSON.stringify(value, null, 2), "utf8");
+    await fs.rename(tmp, filePath);
+  } finally {
+    await fs.unlink(tmp).catch(() => {});
+  }
+}
+
 const bucketConnectSrc = ["'self'"];
 try {
   if (process.env.BUCKET_ENDPOINT) {
@@ -531,18 +541,25 @@ async function readSlotsState() {
 }
 
 async function writeSlotsState(state) {
-  const tmp = SLOT_STATE_FILE + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2), "utf8");
-  await fs.rename(tmp, SLOT_STATE_FILE);
+  await atomicWriteJson(SLOT_STATE_FILE, state);
+}
+
+let slotStateMutation = Promise.resolve();
+function serializeSlotStateMutation(task) {
+  const run = slotStateMutation.then(task, task);
+  slotStateMutation = run.catch(() => {});
+  return run;
 }
 
 async function updateSlotState(slotId, patch) {
   const id = String(slotId);
   if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
-  const state = await readSlotsState();
-  state.slots[id] = { ...(state.slots[id] || {desired:"stopped"}), ...patch };
-  await writeSlotsState(state);
-  return state.slots[id];
+  return serializeSlotStateMutation(async () => {
+    const state = await readSlotsState();
+    state.slots[id] = { ...(state.slots[id] || {desired:"stopped"}), ...patch };
+    await writeSlotsState(state);
+    return state.slots[id];
+  });
 }
 
 function dashboardCryptoKey() {
@@ -614,9 +631,7 @@ function normalizeChannelUrl(value, { legacy=false } = {}) {
 
 
 async function writeStreamConfigs(items) {
-  const tmp = STREAM_CONFIGS_FILE + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify({ items }, null, 2), "utf8");
-  await fs.rename(tmp, STREAM_CONFIGS_FILE);
+  await atomicWriteJson(STREAM_CONFIGS_FILE, { items });
 }
 
 async function readStreamConfigs() {
@@ -808,9 +823,7 @@ async function readBucketMediaState() {
 }
 
 async function writeBucketMediaState(state) {
-  const tmp = BUCKET_MEDIA_FILE + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2), "utf8");
-  await fs.rename(tmp, BUCKET_MEDIA_FILE);
+  await atomicWriteJson(BUCKET_MEDIA_FILE, state);
 }
 
 async function getBucketMedia(id) {
@@ -1088,6 +1101,7 @@ async function analyzeBucketMedia(id) {
 }
 
 const activeSlots = new Map();
+const startingSlots = new Set();
 const restartTimers = new Map();
 let prepareJob = null;
 const prepareQueue = [];
@@ -1378,9 +1392,10 @@ function slotStatusPayload(slotId, desiredState=null) {
   const desired = desiredState || null;
 
   if (!active) {
+    const startPending = startingSlots.has(id);
     const restartPending = restartTimers.has(id);
     const wantsRunning = desired?.desired === "running";
-    const state = restartPending ? "restarting" : wantsRunning ? "recovering" : "idle";
+    const state = startPending ? "starting" : restartPending ? "restarting" : wantsRunning ? "recovering" : "idle";
     return {
       slotId:id,
       state,
@@ -1391,7 +1406,8 @@ function slotStatusPayload(slotId, desiredState=null) {
       startedAt:null,
       metrics:{},
       health:{
-        state:restartPending ? "restarting" : wantsRunning ? "recovering" : "idle",
+        state:startPending ? "starting" : restartPending ? "restarting" : wantsRunning ? "recovering" : "idle",
+        mediaFlowConfirmed:false,
         retryCount:Number(desired?.retryCount || 0),
         lastExitAt:desired?.lastExitAt || null
       },
@@ -1415,6 +1431,7 @@ function slotStatusPayload(slotId, desiredState=null) {
     metrics:active.metrics,
     health:{
       state:active.healthState || "starting",
+      mediaFlowConfirmed:Boolean(active.mediaFlowConfirmed),
       lastHeartbeatAt:active.lastHeartbeatAt || null,
       lastMetricAt:active.lastMetricAt || null,
       lowSpeedSince:active.lowSpeedSince || null,
@@ -1424,7 +1441,18 @@ function slotStatusPayload(slotId, desiredState=null) {
   };
 }
 
-async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=0, streamKey=null, streamId=null, rtmpUrl=null } = {}) {
+async function startStreamInternal(slotId, mediaId, options = {}) {
+  const id = String(slotId);
+  if (startingSlots.has(id)) throw new Error("stream_start_in_progress");
+  startingSlots.add(id);
+  try {
+    return await startStreamInternalUnlocked(slotId, mediaId, options);
+  } finally {
+    startingSlots.delete(id);
+  }
+}
+
+async function startStreamInternalUnlocked(slotId, mediaId, { restore=false, retryCount=0, streamKey=null, streamId=null, rtmpUrl=null } = {}) {
   const id = String(slotId);
   if (!SLOT_IDS.includes(id)) throw new Error("invalid_slot");
   if (activeSlots.has(id)) throw new Error("stream_already_active");
@@ -1471,6 +1499,7 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
     intentionalStop:false,
     retryCount,
     healthState:"starting",
+    mediaFlowConfirmed:false,
     lastHeartbeatAt:new Date().toISOString(),
     lastMetricAt:null,
     lowSpeedSince:null,
@@ -1486,11 +1515,20 @@ async function startStreamInternal(slotId, mediaId, { restore=false, retryCount=
 
     if (msg.type === "heartbeat") {
       current.lastHeartbeatAt = new Date().toISOString();
-      if (current.healthState === "starting") current.healthState = "healthy";
     } else if (msg.type === "metrics" && msg.metrics) {
       current.metrics = { ...current.metrics, ...msg.metrics };
       current.lastMetricAt = new Date().toISOString();
       current.lastHeartbeatAt = current.lastHeartbeatAt || current.lastMetricAt;
+      if (!current.mediaFlowConfirmed) {
+        current.mediaFlowConfirmed = true;
+        void logEvent("stream_media_flow", {
+          slotId:id,
+          mediaId:current.file,
+          streamId:current.streamId || null,
+          bitrate:current.metrics?.bitrate || null,
+          speed:current.metrics?.speed || null
+        });
+      }
       if (!current.healthRestarting) current.healthState = "healthy";
     } else if (msg.type === "ffmpeg_error" || msg.type === "fatal") {
       current.lastError = sanitizeLog(msg.error || "worker_error");
@@ -2549,6 +2587,7 @@ app.get("/health", async (_req, res) => res.json({
   ok:true,
   ffmpeg:true,
   streamingSlots:activeSlots.size,
+  startingSlots:startingSlots.size,
   youtubeKeyConfigured:Boolean(YOUTUBE_STREAM_KEY),
   telegramConfigured:telegramConfigured(),
   bucketConfigured:bucketConfigured(),
@@ -2565,6 +2604,7 @@ app.get("/api/system", requireOwner, async (_req, res) => {
   res.json({
     ok:true,
     streamingSlots:activeSlots.size,
+    startingSlots:startingSlots.size,
     preparing:Boolean(prepareJob),
     prepareQueueLength:prepareQueue.length,
     slotCount:STREAM_SLOT_COUNT,
@@ -3235,6 +3275,7 @@ app.get("/api/prepare/status", requireOwner, (_req, res) => {
 
 function streamErrorStatus(msg) {
   return msg === "stream_already_active" ? 409 :
+    msg === "stream_start_in_progress" ? 409 :
     msg === "slot_stream_key_not_configured" ? 503 :
     msg === "invalid_slot" ? 400 :
     msg === "invalid_media_id" ? 400 :

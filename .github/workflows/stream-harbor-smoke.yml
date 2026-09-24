@@ -5,6 +5,7 @@ on:
     branches:
       - dev-live-hardening
       - "feature-*"
+      - "hotfix-*"
 
 jobs:
   syntax:

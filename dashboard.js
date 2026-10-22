@@ -799,7 +799,7 @@ async function refreshRuntime(){
   try{
     const [s,h]=await Promise.all([
       api("/api/streams"),
-      fetch("/health",{cache:"no-store"}).then(r=>r.json())
+      api("/api/system",{cache:"no-store"})
     ]);
     const fresh=s.items||[];
     q("#serverStatus").textContent=h.ok
@@ -929,7 +929,7 @@ async function loadAll(){
     const [s,m,h]=await Promise.all([
       api("/api/streams"),
       api("/api/media"),
-      fetch("/health",{cache:"no-store"}).then(r=>r.json())
+      api("/api/system",{cache:"no-store"})
     ]);
     state.streams=s.items||[];
     state.media=m.items||[];

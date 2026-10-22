@@ -62,6 +62,17 @@ jobs:
           }
           NODE
 
+      - name: Verify self-hosted controller independence
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const server = fs.readFileSync('server.js','utf8');
+          const worker = fs.readFileSync('.worker.env.example','utf8');
+          if (!server.includes('process.env.PUBLIC_ORIGIN')) throw new Error('missing self-hosted public origin setting');
+          if (server.includes('https://stream-harbor-backend-production.up.railway.app')) throw new Error('provider-specific default in controller');
+          if (/up\\.railway\\.app/.test(worker)) throw new Error('worker template still depends on Railway');
+          NODE
+
       - name: Verify asynchronous stream start contract
         run: |
           node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('res.status(202).json')) throw new Error('missing 202 start acknowledgement'); if(!s.includes('stream_start_requested')) throw new Error('missing start requested event'); if(!s.includes('stream_start_failed')) throw new Error('missing background start failure handling');"

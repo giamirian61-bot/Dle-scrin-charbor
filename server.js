@@ -2792,22 +2792,8 @@ async function listMedia() {
   return items;
 }
 
-app.get("/health", async (_req, res) => res.json({
-  ok:true,
-  ffmpeg:true,
-  streamingSlots:activeSlots.size,
-  startingSlots:startingSlots.size,
-  youtubeKeyConfigured:Boolean(YOUTUBE_STREAM_KEY),
-  telegramConfigured:telegramConfigured(),
-  bucketConfigured:bucketConfigured(),
-  persistentState:true,
-  preparing:Boolean(prepareJob),
-  prepareQueueLength:prepareQueue.length,
-  slotCount:STREAM_SLOT_COUNT,
-  executionMode:STREAM_EXECUTION_MODE,
-  workerNodes:STREAM_EXECUTION_MODE === "remote" ? [...remoteWorkerNodes.keys()].length : 0,
-  storage:await storageStats()
-}));
+// Public liveness check for Railway: do not expose internal stream, key, or storage metadata.
+app.get("/health", (_req, res) => res.json({ ok:true }));
 
 app.get("/api/system", requireOwner, async (_req, res) => {
   res.json({

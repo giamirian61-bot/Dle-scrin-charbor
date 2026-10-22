@@ -45,6 +45,23 @@ jobs:
       - name: Syntax check dashboard
         run: node --check dashboard.js
 
+      - name: Verify health endpoint privacy contract
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const server = fs.readFileSync('server.js','utf8');
+          const dashboard = fs.readFileSync('dashboard.js','utf8');
+          if (!server.includes('app.get("/health", (_req, res) => res.json({ ok:true }));')) {
+            throw new Error('Public liveness endpoint must not expose internal runtime metadata');
+          }
+          if (!server.includes('app.get("/api/system", requireOwner,')) {
+            throw new Error('Detailed runtime status must remain owner-authenticated');
+          }
+          if (dashboard.includes('fetch("/health"') || !dashboard.includes('api("/api/system",{cache:"no-store"})')) {
+            throw new Error('Dashboard must fetch runtime data from authenticated endpoint');
+          }
+          NODE
+
       - name: Verify asynchronous stream start contract
         run: |
           node -e "const s=require('fs').readFileSync('server.js','utf8'); if(!s.includes('res.status(202).json')) throw new Error('missing 202 start acknowledgement'); if(!s.includes('stream_start_requested')) throw new Error('missing start requested event'); if(!s.includes('stream_start_failed')) throw new Error('missing background start failure handling');"

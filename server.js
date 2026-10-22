@@ -4417,7 +4417,7 @@ const server = app.listen(PORT, "0.0.0.0", () => {
     let origin = "";
     try {
       const parsed = new URL(configuredOrigin);
-      if (parsed.protocol === "https:" && parsed.origin === configuredOrigin.replace(/\\/$/, "")) {
+      if (parsed.protocol === "https:" && parsed.origin === configuredOrigin.replace(/\/$/, "")) {
         origin = parsed.origin;
       }
     } catch {}

@@ -4408,15 +4408,29 @@ const server = app.listen(PORT, "0.0.0.0", () => {
       error:sanitizeLog(err?.message || err)
     })));
   if (bucketConfigured()) {
-    const origin = process.env.RAILWAY_PUBLIC_DOMAIN
-      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-      : "https://stream-harbor-backend-production.up.railway.app";
-    ensureBucketCors(origin)
-      .then(() => console.log(JSON.stringify({ event:"bucket_cors_ready", origin })))
-      .catch(err => console.error(JSON.stringify({
-        event:"bucket_cors_failed",
-        error:sanitizeLog(err?.message || err)
-      })));
+    // Prefer an explicit HTTPS controller origin. Railway remains a supported
+    // deployment target, but is never assumed on a self-hosted installation.
+    const configuredOrigin = String(
+      process.env.PUBLIC_ORIGIN ||
+      (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : "")
+    ).trim();
+    let origin = "";
+    try {
+      const parsed = new URL(configuredOrigin);
+      if (parsed.protocol === "https:" && parsed.origin === configuredOrigin.replace(/\\/$/, "")) {
+        origin = parsed.origin;
+      }
+    } catch {}
+    if (!origin) {
+      console.warn(JSON.stringify({ event:"bucket_cors_skipped", reason:"public_https_origin_not_configured" }));
+    } else {
+      ensureBucketCors(origin)
+        .then(() => console.log(JSON.stringify({ event:"bucket_cors_ready", origin })))
+        .catch(err => console.error(JSON.stringify({
+          event:"bucket_cors_failed",
+          error:sanitizeLog(err?.message || err)
+        })));
+    }
   }
   void notifyTelegram(`🟢 Stream Harbor
 Сервер запущен

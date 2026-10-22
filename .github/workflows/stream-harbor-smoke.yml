@@ -6,6 +6,12 @@ on:
       - dev-live-hardening
       - "feature-*"
       - "hotfix-*"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
 
 jobs:
   syntax:
@@ -18,10 +24,17 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install dependencies
         run: npm install --omit=dev
+
+      - name: Reject credential material in tracked files
+        run: |
+          if git grep -I -q -E '(-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{20,}|ghp_[A-Za-z0-9]{30,}|sk-proj-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})' -- .; then
+            echo "::error::Potential secret committed to tracked files; remove and rotate it."
+            exit 1
+          fi
 
       - name: Syntax check backend
         run: node --check server.js
